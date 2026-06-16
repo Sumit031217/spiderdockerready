@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 from geopy.distance import geodesic
 from shapely.geometry import Polygon, Point
@@ -36,6 +36,8 @@ class DeviceModel(BaseModel):
     outerRange: float
     azimuth: float
     fov: float
+    isPolygon: bool = False
+    polygon: Optional[list] = []  # Allows Python to catch the PIDS boundary array from React
 
 class TransmitRequest(BaseModel):
     targetIp: str
@@ -49,7 +51,7 @@ class ExportRequest(BaseModel):
     alerts: List[dict]
 
 # ==========================================================
-# PHYSICS & MATH (From radar_simulator_v2.5.py)
+# PHYSICS & MATH
 # ==========================================================
 def generate_uniform_distance(min_range, max_range):
     return math.sqrt(random.uniform(min_range ** 2, max_range ** 2))
@@ -60,10 +62,10 @@ def determine_priority(distance):
     return "LOW"
 
 # ==========================================================
-# PACKET BUILDERS (From radar_simulator_v2.5.py)
+# PACKET BUILDERS
 # ==========================================================
 def build_spider_packet(alert, device, track_id):
-    """Exact 21-Index SPIDER format as requested in Docs"""
+    """Exact 21-Index SPIDER format"""
     dev_type_int = 9 if device.type.lower() == "radar" else 10 if device.type.lower() == "camera" else 11
     fov_start = (device.azimuth - (device.fov / 2)) % 360
     fov_end = (device.azimuth + (device.fov / 2)) % 360
@@ -85,31 +87,56 @@ def build_spider_packet(alert, device, track_id):
 async def calculate_and_transmit(payload: TransmitRequest):
     dev = payload.device
     
-    # EXACT GEOPY MATH FROM YOUR SCRIPT
-    distance = generate_uniform_distance(dev.innerRange, dev.outerRange)
-    
-    if dev.type.lower() == "camera":
-        half_fov = dev.fov / 2
-        bearing = random.uniform(dev.azimuth - half_fov, dev.azimuth + half_fov) % 360
-    else:
-        bearing = random.uniform(0, 360)
+    # --- PIDS POLYGON PERIMETER LOGIC (0-10m Buffer) ---
+    if dev.type.upper() == "PIDS" and dev.isPolygon and dev.polygon and len(dev.polygon) > 1:
+        # 1. Pick a random edge (line segment) along the PIDS boundary
+        idx = random.randint(0, len(dev.polygon) - 1)
+        p1 = dev.polygon[idx]
+        p2 = dev.polygon[(idx + 1) % len(dev.polygon)]
+        
+        # 2. Interpolate a random point exactly on that edge
+        fraction = random.uniform(0, 1)
+        edge_lat = p1[0] + fraction * (p2[0] - p1[0])
+        edge_lng = p1[1] + fraction * (p2[1] - p1[1])
+        
+        # 3. Apply a random offset (0 to 10 meters) from that edge point
+        offset_dist = random.uniform(0, 10)
+        offset_bearing = random.uniform(0, 360)
+        destination = geodesic(meters=offset_dist).destination((edge_lat, edge_lng), offset_bearing)
+        
+        alert_lat = round(destination.latitude, 8)
+        alert_lng = round(destination.longitude, 8)
+        distance = round(offset_dist, 2)
+        bearing = round(offset_bearing, 2)
+        priority = "HIGH"  # PIDS alerts are automatically highest priority
 
-    destination = geodesic(meters=distance).destination((dev.lat, dev.lng), bearing)
-    priority = determine_priority(distance)
+    # --- STANDARD RADAR / CAMERA LOGIC ---
+    else:
+        distance = generate_uniform_distance(dev.innerRange, dev.outerRange)
+        if dev.type.lower() == "camera":
+            half_fov = dev.fov / 2
+            bearing = random.uniform(dev.azimuth - half_fov, dev.azimuth + half_fov) % 360
+        else:
+            bearing = random.uniform(0, 360)
+
+        destination = geodesic(meters=distance).destination((dev.lat, dev.lng), bearing)
+        alert_lat = round(destination.latitude, 8)
+        alert_lng = round(destination.longitude, 8)
+        priority = determine_priority(distance)
 
     alert_data = {
         "sensor_type": dev.type.upper(),
         "sensor_name": dev.id,
         "alert_id": payload.trackId,
         "priority": priority,
-        "latitude": round(destination.latitude, 8),
-        "longitude": round(destination.longitude, 8),
+        "latitude": alert_lat,
+        "longitude": alert_lng,
         "distance_m": round(distance, 2),
         "bearing": round(bearing, 2),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
-    # FIRE UDP PACKET (THIS ACTUALLY SENDS THE DATA)
+    # FIRE UDP PACKET
     packet_string = build_spider_packet(alert_data, dev, payload.trackId)
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -125,14 +152,14 @@ async def calculate_and_transmit(payload: TransmitRequest):
 @app.post("/api/export")
 async def generate_exports(payload: ExportRequest):
     
-    # 1. GENERATE CSV EXACTLY LIKE SCRIPT
+    # 1. GENERATE CSV
     csv_io = StringIO()
     writer = csv.writer(csv_io)
     writer.writerow(["sensor_type", "sensor_name", "alert_id", "priority", "latitude", "longitude", "distance_m", "bearing", "timestamp"])
     for alert in payload.alerts:
         writer.writerow([alert["sensor_type"], alert["sensor_name"], alert["alert_id"], alert["priority"], alert["latitude"], alert["longitude"], alert["distance_m"], alert["bearing"], alert["timestamp"]])
     
-    # 2. GENERATE KML EXACTLY LIKE SCRIPT
+    # 2. GENERATE KML
     kml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
@@ -148,41 +175,52 @@ async def generate_exports(payload: ExportRequest):
     <Style id="pidsAlertStyle"><IconStyle><color>ffffff00</color><scale>1.3</scale></IconStyle></Style>
 '''
 
-    # Draw Physical Sensors & Geometries (Circles/Arcs)
+    # Draw Physical Sensors & Geometries
     for dev in payload.devices:
-        style = "#radarStyle" if dev.type.lower() == "radar" else "#cameraStyle"
-        kml += f'<Placemark><name>{dev.id}</name><styleUrl>{style}</styleUrl><Point><coordinates>{dev.lng},{dev.lat},0</coordinates></Point></Placemark>'
-        
-        if dev.type.lower() == "camera":
-            # Draw EXACT Camera Arc
-            start_bearing = (dev.azimuth - (dev.fov / 2)) % 360
-            end_bearing = (dev.azimuth + (dev.fov / 2)) % 360
-            arc_points = []
-            angle = start_bearing
-            while True:
-                pt = geodesic(meters=dev.outerRange).destination((dev.lat, dev.lng), angle)
-                arc_points.append(f"{pt.longitude},{pt.latitude},0")
-                angle = (angle + 2) % 360
-                if abs((angle - end_bearing + 360) % 360) < 2: break
-            
+        # PIDS Polygons
+        if dev.isPolygon and dev.polygon:
+            perimeter_coords = " ".join([f"{pt[1]},{pt[0]},0" for pt in dev.polygon])
+            # Add first point to close loop
+            perimeter_coords += f" {dev.polygon[0][1]},{dev.polygon[0][0]},0"
             kml += f'''
-            <Placemark><name>{dev.id} FOV</name>
-                <Style><LineStyle><color>66ff0000</color><width>1</width></LineStyle><PolyStyle><color>2200ff00</color></PolyStyle></Style>
-                <Polygon><outerBoundaryIs><LinearRing><coordinates>{dev.lng},{dev.lat},0 {" ".join(arc_points)} {dev.lng},{dev.lat},0</coordinates></LinearRing></outerBoundaryIs></Polygon>
+            <Placemark><name>{dev.id} Boundary</name>
+                <Style><LineStyle><color>ff0000ff</color><width>3</width></LineStyle><PolyStyle><color>440000ff</color></PolyStyle></Style>
+                <Polygon><outerBoundaryIs><LinearRing><coordinates>{perimeter_coords}</coordinates></LinearRing></outerBoundaryIs></Polygon>
             </Placemark>'''
             
-        elif dev.type.lower() == "radar":
-            # Draw EXACT Radar Circles
-            outer_pts = []
-            inner_pts = []
-            for angle in range(361):
-                opt = geodesic(meters=dev.outerRange).destination((dev.lat, dev.lng), angle)
-                ipt = geodesic(meters=dev.innerRange).destination((dev.lat, dev.lng), angle)
-                outer_pts.append(f"{opt.longitude},{opt.latitude},0")
-                inner_pts.append(f"{ipt.longitude},{ipt.latitude},0")
+        # Radars and Cameras
+        else:
+            style = "#radarStyle" if dev.type.lower() == "radar" else "#cameraStyle"
+            kml += f'<Placemark><name>{dev.id}</name><styleUrl>{style}</styleUrl><Point><coordinates>{dev.lng},{dev.lat},0</coordinates></Point></Placemark>'
             
-            kml += f'<Placemark><name>{dev.id} Boundary</name><LineString><coordinates>{" ".join(outer_pts)}</coordinates></LineString></Placemark>'
-            kml += f'<Placemark><name>{dev.id} Exclusion</name><LineString><coordinates>{" ".join(inner_pts)}</coordinates></LineString></Placemark>'
+            if dev.type.lower() == "camera":
+                start_bearing = (dev.azimuth - (dev.fov / 2)) % 360
+                end_bearing = (dev.azimuth + (dev.fov / 2)) % 360
+                arc_points = []
+                angle = start_bearing
+                while True:
+                    pt = geodesic(meters=dev.outerRange).destination((dev.lat, dev.lng), angle)
+                    arc_points.append(f"{pt.longitude},{pt.latitude},0")
+                    angle = (angle + 2) % 360
+                    if abs((angle - end_bearing + 360) % 360) < 2: break
+                
+                kml += f'''
+                <Placemark><name>{dev.id} FOV</name>
+                    <Style><LineStyle><color>66ff0000</color><width>1</width></LineStyle><PolyStyle><color>2200ff00</color></PolyStyle></Style>
+                    <Polygon><outerBoundaryIs><LinearRing><coordinates>{dev.lng},{dev.lat},0 {" ".join(arc_points)} {dev.lng},{dev.lat},0</coordinates></LinearRing></outerBoundaryIs></Polygon>
+                </Placemark>'''
+                
+            elif dev.type.lower() == "radar":
+                outer_pts = []
+                inner_pts = []
+                for angle in range(361):
+                    opt = geodesic(meters=dev.outerRange).destination((dev.lat, dev.lng), angle)
+                    ipt = geodesic(meters=dev.innerRange).destination((dev.lat, dev.lng), angle)
+                    outer_pts.append(f"{opt.longitude},{opt.latitude},0")
+                    inner_pts.append(f"{ipt.longitude},{ipt.latitude},0")
+                
+                kml += f'<Placemark><name>{dev.id} Boundary</name><LineString><coordinates>{" ".join(outer_pts)}</coordinates></LineString></Placemark>'
+                kml += f'<Placemark><name>{dev.id} Exclusion</name><LineString><coordinates>{" ".join(inner_pts)}</coordinates></LineString></Placemark>'
 
     # Draw Generated Alerts
     for alert in payload.alerts:

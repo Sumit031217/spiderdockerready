@@ -2,10 +2,30 @@ import React, { useState } from 'react';
 import { 
   Shield, Settings, Server, MapPin, Trash2, CheckCircle, 
   Upload, Network, Clock, FileOutput, Save, BellDot, 
-  Globe, Sliders, Play, Square, Terminal, CheckSquare, Download
+  Globe, Sliders, Play, Square, Terminal, CheckSquare, Download, Target
 } from 'lucide-react';
-import { MapContainer, TileLayer, Popup, CircleMarker, Circle } from 'react-leaflet';
+import { MapContainer, TileLayer, Popup, CircleMarker, Circle, Polygon as LeafletPolygon } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
+
+// ==========================================
+// GEOMETRY ENGINE: Calculates Camera FOV Arcs
+// ==========================================
+const getCameraFovPolygon = (lat, lng, radiusMeters, azimuth, fov) => {
+  const R = 6371000;
+  const centerLat = lat * (Math.PI / 180);
+  const centerLng = lng * (Math.PI / 180);
+  const points = [[lat, lng]]; // Start at camera center
+  const startAngle = azimuth - (fov / 2);
+  const endAngle = azimuth + (fov / 2);
+
+  for (let angle = startAngle; angle <= endAngle; angle += 2) {
+    const brng = angle * (Math.PI / 180);
+    const pLat = Math.asin(Math.sin(centerLat) * Math.cos(radiusMeters / R) + Math.cos(centerLat) * Math.sin(radiusMeters / R) * Math.cos(brng));
+    const pLng = centerLng + Math.atan2(Math.sin(brng) * Math.sin(radiusMeters / R) * Math.cos(centerLat), Math.cos(radiusMeters / R) - Math.sin(centerLat) * Math.sin(pLat));
+    points.push([pLat * (180 / Math.PI), pLng * (180 / Math.PI)]);
+  }
+  return points;
+};
 
 // ==========================================
 // MODULE 1: DEVICE CONFIGURATION
@@ -42,30 +62,50 @@ const DeviceConfigView = ({ devices, setDevices }) => {
           const placemarks = xml.querySelectorAll("Placemark");
 
           placemarks.forEach(pm => {
-            const coordNode = pm.querySelector("coordinates");
-            const descNode = pm.querySelector("description");
-            if (coordNode && descNode) {
-              const coords = coordNode.textContent.trim().split(",");
-              const desc = descNode.textContent;
-              const extract = (key) => {
-                const match = desc.match(new RegExp(`<B>${key}</B>\\s*=\\s*([^<]+)`, 'i'));
-                return match ? match[1].trim() : null;
-              };
-              parsedDevices.push({
-                id: extract("SensorId") || `UNK_${Math.floor(Math.random()*1000)}`,
-                type: extract("SensorType") || "Unknown",
-                innerRange: parseFloat(extract("InnerRange") || 0),
-                outerRange: parseFloat(extract("OuterRange") || 100),
-                azimuth: parseFloat(extract("Azimuth") || 0),
-                fov: parseFloat(extract("FOV") || 360),
-                lat: parseFloat(coords[1]),
-                lng: parseFloat(coords[0])
+            // 1. Check if it's a PIDS Polygon
+            const polyNode = pm.querySelector("Polygon coordinates");
+            if (polyNode) {
+              const coordText = polyNode.textContent.trim().split(/\s+/);
+              const latLngs = coordText.filter(c => c.includes(',')).map(c => {
+                const [lng, lat] = c.split(',');
+                return [parseFloat(lat), parseFloat(lng)];
               });
+              parsedDevices.push({
+                id: pm.querySelector("name")?.textContent || `PIDS_BOUNDARY_${Math.floor(Math.random()*1000)}`,
+                type: "PIDS",
+                isPolygon: true,
+                polygon: latLngs,
+                lat: latLngs[0][0], lng: latLngs[0][1], // Fallback center
+                innerRange: 0, outerRange: 0, azimuth: 0, fov: 0
+              });
+            } else {
+              // 2. Check if it's a Standard Point (Radar/Camera)
+              const coordNode = pm.querySelector("Point coordinates");
+              const descNode = pm.querySelector("description");
+              if (coordNode && descNode) {
+                const coords = coordNode.textContent.trim().split(",");
+                const desc = descNode.textContent;
+                const extract = (key) => {
+                  const match = desc.match(new RegExp(`<B>${key}</B>\\s*=\\s*([^<]+)`, 'i'));
+                  return match ? match[1].trim() : null;
+                };
+                parsedDevices.push({
+                  id: extract("SensorId") || `UNK_${Math.floor(Math.random()*1000)}`,
+                  type: extract("SensorType") || "Unknown",
+                  isPolygon: false,
+                  innerRange: parseFloat(extract("InnerRange") || 0),
+                  outerRange: parseFloat(extract("OuterRange") || 100),
+                  azimuth: parseFloat(extract("Azimuth") || 0),
+                  fov: parseFloat(extract("FOV") || 360),
+                  lat: parseFloat(coords[1]),
+                  lng: parseFloat(coords[0])
+                });
+              }
             }
           });
         }
         setDevices(prev => [...prev, ...parsedDevices]);
-        setStatus({ message: `Imported ${parsedDevices.length} devices from ${file.name}`, type: 'success' });
+        setStatus({ message: `Imported ${parsedDevices.length} assets from ${file.name}`, type: 'success' });
         event.target.value = '';
       } catch (err) {
         setStatus({ message: `Import Error: ${err.message}`, type: 'error' });
@@ -76,7 +116,7 @@ const DeviceConfigView = ({ devices, setDevices }) => {
 
   const handleManualSubmit = (e) => {
     e.preventDefault();
-    setDevices(prev => [...prev, { ...formData, lat: parseFloat(formData.lat), lng: parseFloat(formData.lng) }]);
+    setDevices(prev => [...prev, { ...formData, isPolygon: false, lat: parseFloat(formData.lat), lng: parseFloat(formData.lng) }]);
     setStatus({ message: `Manually added ${formData.id}`, type: 'success' });
     setFormData({ id: '', type: 'Radar', lat: '', lng: '', innerRange: 0, outerRange: 250, azimuth: 0, fov: 360 });
   };
@@ -90,7 +130,7 @@ const DeviceConfigView = ({ devices, setDevices }) => {
           <h2 className="text-2xl font-bold text-emerald-400 flex items-center space-x-2">
             <Settings className="w-6 h-6" /> <span>Device Configuration</span>
           </h2>
-          <p className="text-slate-400 text-sm mt-1">Import via KML/JSON/CSV or manually configure simulation hardware.</p>
+          <p className="text-slate-400 text-sm mt-1">Import KMLs (Points & Polygons) or manually deploy hardware.</p>
         </div>
         <div className={`px-4 py-2 rounded font-mono text-xs font-bold border ${status.type === 'error' ? 'bg-rose-950/50 border-rose-800 text-rose-400' : 'bg-emerald-950/50 border-emerald-800 text-emerald-400'}`}>
           {status.message}
@@ -105,12 +145,12 @@ const DeviceConfigView = ({ devices, setDevices }) => {
               <input type="file" accept=".json,.kml,.csv" onChange={handleFileUpload} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
               <MapPin className="w-8 h-8 text-slate-500 mx-auto mb-2" />
               <p className="text-sm font-bold text-slate-300">Drag & Drop or Click to Upload</p>
-              <p className="text-xs text-slate-500 mt-1">Supports .KML, .JSON, and .CSV</p>
+              <p className="text-xs text-slate-500 mt-1">Supports Radar KMLs, Camera JSON, and PIDS Polygons</p>
             </div>
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
-            <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-4 flex items-center"><Settings className="w-4 h-4 mr-2 text-amber-400"/> Manual Entry</h3>
+            <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-4 flex items-center"><Settings className="w-4 h-4 mr-2 text-amber-400"/> Manual Point Entry</h3>
             <form onSubmit={handleManualSubmit} className="space-y-4 text-sm">
               <div className="grid grid-cols-2 gap-4">
                 <div className="col-span-2"><label className="block text-xs text-slate-500 mb-1">Sensor ID</label><input required value={formData.id} onChange={e => setFormData({...formData, id: e.target.value})} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-white" /></div>
@@ -145,10 +185,10 @@ const DeviceConfigView = ({ devices, setDevices }) => {
                 </div>
               ) : (
                 <table className="w-full text-left text-sm whitespace-nowrap">
-                  <thead className="bg-slate-950/50 text-slate-400 font-mono text-xs sticky top-0 z-10">
+                  <thead className="bg-slate-950/50 text-slate-400 font-mono text-xs sticky top-0">
                     <tr>
                       <th className="p-3">ID / Type</th>
-                      <th className="p-3">Location</th>
+                      <th className="p-3">Location/Boundary</th>
                       <th className="p-3">Range</th>
                       <th className="p-3">Angles</th>
                       <th className="p-3 text-right">Actions</th>
@@ -158,9 +198,11 @@ const DeviceConfigView = ({ devices, setDevices }) => {
                     {devices.map((dev, idx) => (
                       <tr key={idx} className="hover:bg-slate-800/30">
                         <td className="p-3"><div className="font-bold text-slate-200">{dev.id}</div><div className="text-xs text-slate-500 uppercase">{dev.type}</div></td>
-                        <td className="p-3 font-mono text-xs text-slate-400">{dev.lat.toFixed(4)}, {dev.lng.toFixed(4)}</td>
-                        <td className="p-3 font-mono text-cyan-400">{dev.innerRange}m - {dev.outerRange}m</td>
-                        <td className="p-3 font-mono text-amber-400">{dev.azimuth}° / {dev.fov}°</td>
+                        <td className="p-3 font-mono text-xs text-slate-400">
+                          {dev.isPolygon ? 'POLYGON DEFINED' : `${dev.lat.toFixed(4)}, ${dev.lng.toFixed(4)}`}
+                        </td>
+                        <td className="p-3 font-mono text-cyan-400">{dev.isPolygon ? 'N/A' : `${dev.innerRange}m - ${dev.outerRange}m`}</td>
+                        <td className="p-3 font-mono text-amber-400">{dev.isPolygon ? 'N/A' : `${dev.azimuth}° / ${dev.fov}°`}</td>
                         <td className="p-3 text-right"><button onClick={() => removeDevice(dev.id)} className="text-slate-500 hover:text-rose-400"><Trash2 className="w-4 h-4 inline" /></button></td>
                       </tr>
                     ))}
@@ -264,7 +306,7 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices }) => {
 // ==========================================
 // MODULE 3: ALERT GENERATOR
 // ==========================================
-const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, setCompletedRuns }) => {
+const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, setCompletedRuns, setActiveAlerts }) => {
   const [isRunning, setIsRunning] = useState(false);
   const [logs, setLogs] = useState([]);
   const [progress, setProgress] = useState(0);
@@ -283,6 +325,9 @@ const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, se
     setIsRunning(true);
     setLogs([{ time: new Date().toLocaleTimeString(), msg: `SYSTEM: Engaging '${scenario.name}'. Connecting to UDP Engine at 127.0.0.1:8000...`, type: 'info' }]);
     setProgress(0);
+    
+    // Clear old map points
+    setActiveAlerts([]); 
 
     let currentAlert = 0;
     let generatedAlertsMemory = []; 
@@ -300,7 +345,7 @@ const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, se
 
       currentAlert++;
       const dev = activeFleet[Math.floor(Math.random() * activeFleet.length)];
-      
+
       try {
         const response = await fetch('http://127.0.0.1:8000/api/transmit', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -314,6 +359,7 @@ const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, se
 
         if (result.status === "success") {
             generatedAlertsMemory.push(result.alert_data);
+            setActiveAlerts(prev => [...prev, result.alert_data]);
             setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `[${dev.id}] SPIDER -> ${result.packet}`, type: 'success' }, ...prev]);
         } else {
             setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `[ERROR] Python Error: ${result.message}`, type: 'error' }, ...prev]);
@@ -324,7 +370,6 @@ const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, se
       }
 
       setProgress(Math.floor((currentAlert / alertConfig.totalAlerts) * 100));
-
       const delay = Math.random() * (alertConfig.maxDelaySec - alertConfig.minDelaySec) + alertConfig.minDelaySec;
       window.simTimeout = setTimeout(runTick, delay * 1000);
     };
@@ -405,11 +450,11 @@ const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, se
 };
 
 // ==========================================
-// VIEW 4: TACTICAL MAP
+// VIEW 4: TACTICAL MAP (LIGHT THEME & EXACT OVERLAYS)
 // ==========================================
-const MapView = ({ devices }) => {
-  // Initialization Coordinates (Mira Road Sector)
-  const defaultPosition = [19.2813, 72.8693]; 
+const MapView = ({ devices, alerts }) => {
+  // If devices are loaded, center on the first one. Otherwise, default fallback.
+  const mapCenter = devices.length > 0 && devices[0].lat ? [devices[0].lat, devices[0].lng] : [19.2813, 72.8693];
 
   return (
     <div className="p-6 space-y-6 max-w-[1600px] mx-auto h-[calc(100vh-4rem)] flex flex-col font-sans">
@@ -419,63 +464,102 @@ const MapView = ({ devices }) => {
             <Globe className="w-6 h-6 text-cyan-400" />
             <span>Tactical Map Visualizer</span>
           </h2>
-          <p className="text-slate-400 text-sm mt-1">Live geographic tracking, KML boundary rendering, and spatial telemetry.</p>
+          <p className="text-slate-400 text-sm mt-1">Live tracking on high-visibility CartoDB Voyager layer.</p>
         </div>
         <div className="flex space-x-3">
-          <div className="flex items-center space-x-2 bg-slate-900 border border-slate-800 rounded px-3 py-1">
-            <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-            <span className="text-xs font-mono text-emerald-400">SAT-LINK ACTIVE</span>
-          </div>
-          <div className="flex items-center space-x-2 bg-slate-900 border border-slate-800 rounded px-3 py-1">
-            <span className="text-xs font-mono text-cyan-400">NODES: {devices ? devices.length : 0}</span>
+          <div className="flex items-center space-x-2 bg-rose-950/40 border border-rose-900 rounded px-3 py-1">
+            <Target className="w-4 h-4 text-rose-500" />
+            <span className="text-xs font-mono text-rose-400 font-bold">ACTIVE THREATS: {alerts ? alerts.length : 0}</span>
           </div>
         </div>
       </div>
 
-      <div className="flex-1 rounded-xl overflow-hidden border border-slate-800 shadow-2xl relative z-0">
+      <div className="flex-1 rounded-xl overflow-hidden border border-slate-300 shadow-2xl relative z-0">
         <MapContainer 
-          center={defaultPosition} 
-          zoom={13} 
+          center={mapCenter} 
+          zoom={14} 
           className="h-full w-full"
-          style={{ background: '#0f172a' }}
+          style={{ background: '#f8fafc' }}
         >
+          {/* THE LIGHT THEME MAP (Matches Google Earth visibility better) */}
           <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+            attribution='&copy; <a href="https://carto.com/">CartoDB</a>'
+            url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
           />
-          
-          {/* Default Origin Node */}
-          <CircleMarker center={defaultPosition} radius={8} pathOptions={{ color: '#10b981', fillColor: '#10b981', fillOpacity: 0.5 }}>
-            <Popup className="font-mono text-xs text-slate-800"><strong className="block text-sm mb-1">SimCore Node Alpha</strong>Status: SECURE</Popup>
-          </CircleMarker>
 
-          {/* Dynamic Device Plotting */}
+          {/* PLOT SENSOR HARDWARE & BOUNDARIES */}
           {devices && devices.map((dev) => (
             <React.Fragment key={dev.id}>
-              <CircleMarker 
-                center={[dev.lat, dev.lng]} 
-                radius={6} 
-                pathOptions={{ 
-                  color: dev.type === 'Radar' ? '#38bdf8' : dev.type === 'Camera' ? '#fbbf24' : '#f43f5e', 
-                  fillColor: dev.type === 'Radar' ? '#38bdf8' : dev.type === 'Camera' ? '#fbbf24' : '#f43f5e', 
-                  fillOpacity: 0.8 
-                }}
-              >
-                <Popup className="font-mono text-xs">
-                  <strong className="block text-sm mb-1">{dev.id}</strong>
-                  Type: {dev.type}<br/>Coords: {dev.lat.toFixed(4)}, {dev.lng.toFixed(4)}<br/>Range: {dev.innerRange}m - {dev.outerRange}m
-                </Popup>
-              </CircleMarker>
-              <Circle 
-                center={[dev.lat, dev.lng]} 
-                radius={dev.outerRange} 
-                pathOptions={{ 
-                  color: dev.type === 'Radar' ? '#38bdf8' : dev.type === 'Camera' ? '#fbbf24' : '#f43f5e', 
-                  fillOpacity: 0.05, weight: 1, dashArray: "5, 5" 
-                }} 
-              />
+              
+              {/* 1. PIDS BOUNDARY POLYGON (Like the massive Red area in your image) */}
+              {dev.isPolygon && (
+                <LeafletPolygon 
+                  positions={dev.polygon} 
+                  pathOptions={{ color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.3, weight: 3 }}
+                >
+                   <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>PIDS Perimeter</Popup>
+                </LeafletPolygon>
+              )}
+
+              {/* 2. CAMERA FOV CONE (Pie Slices) */}
+              {!dev.isPolygon && dev.type.toUpperCase() === 'CAMERA' && (
+                <LeafletPolygon 
+                  positions={getCameraFovPolygon(dev.lat, dev.lng, dev.outerRange, dev.azimuth, dev.fov)}
+                  pathOptions={{ color: '#eab308', fillColor: '#eab308', fillOpacity: 0.2, weight: 1 }}
+                />
+              )}
+
+              {/* 3. RADAR EXCLUSION ZONES (Double Rings) */}
+              {!dev.isPolygon && dev.type.toUpperCase() === 'RADAR' && (
+                <>
+                  {/* Outer Coverage Ring */}
+                  <Circle center={[dev.lat, dev.lng]} radius={dev.outerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.05, weight: 1, dashArray: "5, 5" }} />
+                  {/* Inner Exclusion Ring */}
+                  <Circle center={[dev.lat, dev.lng]} radius={dev.innerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.0, weight: 2 }} />
+                </>
+              )}
+
+              {/* 4. THE HARDWARE PIN */}
+              {!dev.isPolygon && (
+                <CircleMarker 
+                  center={[dev.lat, dev.lng]} 
+                  radius={5} 
+                  pathOptions={{ 
+                    color: '#0f172a', // Dark border
+                    fillColor: dev.type.toUpperCase() === 'RADAR' ? '#ef4444' : dev.type.toUpperCase() === 'CAMERA' ? '#eab308' : '#22c55e', 
+                    fillOpacity: 1, weight: 2 
+                  }}
+                >
+                  <Popup className="font-mono text-xs">
+                    <strong className="block text-sm mb-1">{dev.id}</strong>
+                    Type: {dev.type}<br/>Range: {dev.innerRange}m - {dev.outerRange}m
+                  </Popup>
+                </CircleMarker>
+              )}
             </React.Fragment>
           ))}
+
+          {/* PLOT LIVE ALERTS EXACTLY LIKE YOUR IMAGE */}
+          {alerts && alerts.map((alert, idx) => {
+             // Radar=Red, Camera=Yellow, PIDS=Green
+             const type = alert.sensor_type.toUpperCase();
+             const pinColor = type === 'RADAR' ? '#dc2626' : type === 'CAMERA' ? '#facc15' : '#22c55e';
+
+             return (
+               <CircleMarker 
+                 key={`alert-${idx}`}
+                 center={[alert.latitude, alert.longitude]} 
+                 radius={6} 
+                 pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}
+               >
+                 <Popup className="font-mono text-xs">
+                   <strong className="block text-sm mb-1">{alert.sensor_type} ALERT</strong>
+                   Track ID: {alert.alert_id}<br/>
+                   Distance: {alert.distance_m}m
+                 </Popup>
+               </CircleMarker>
+             );
+          })}
         </MapContainer>
       </div>
     </div>
@@ -503,7 +587,8 @@ const ExportView = ({ completedRuns }) => {
       const csvBlob = new Blob([data.csv_content], { type: 'text/csv' });
       const csvUrl = URL.createObjectURL(csvBlob);
       const link2 = document.createElement('a');
-      link2.href = csvUrl; link2.download = `${run.scenarioName.replace(/\s+/g, '_')}_Output.csv`;
+      link2.href = csvUrl;
+      link2.download = `${run.scenarioName.replace(/\s+/g, '_')}_Output.csv`;
       link2.click();
 
     } catch (err) {
@@ -569,7 +654,7 @@ const ExportView = ({ completedRuns }) => {
 // ==========================================
 export default function App() {
   const [currentView, setCurrentView] = useState('Device Configuration');
-  
+
   // THE GLOBAL STATE
   const [devices, setDevices] = useState([]);
   const [scenario, setScenario] = useState({
@@ -578,8 +663,8 @@ export default function App() {
   const [alertConfig, setAlertConfig] = useState({
     totalAlerts: 10, minDelaySec: 0.1, maxDelaySec: 0.5
   });
-  
   const [completedRuns, setCompletedRuns] = useState([]);
+  const [activeAlerts, setActiveAlerts] = useState([]);
 
   const menuItems = [
     { name: 'Device Configuration', icon: Settings },
@@ -624,8 +709,8 @@ export default function App() {
         <div className="flex-1 overflow-y-auto">
           {currentView === 'Device Configuration' && <DeviceConfigView devices={devices} setDevices={setDevices} />}
           {currentView === 'Scenario Builder' && <ScenarioBuilderView devices={devices} scenario={scenario} setScenario={setScenario} />}
-          {currentView === 'Tactical Map' && <MapView devices={devices} />}
-          {currentView === 'Alert Generator' && <AlertGeneratorView devices={devices} scenario={scenario} alertConfig={alertConfig} setAlertConfig={setAlertConfig} setCompletedRuns={setCompletedRuns} />}
+          {currentView === 'Tactical Map' && <MapView devices={devices} alerts={activeAlerts} />}
+          {currentView === 'Alert Generator' && <AlertGeneratorView devices={devices} scenario={scenario} alertConfig={alertConfig} setAlertConfig={setAlertConfig} setCompletedRuns={setCompletedRuns} setActiveAlerts={setActiveAlerts} />}
           {currentView === 'Reports / Export' && <ExportView completedRuns={completedRuns} />}
         </div>
       </main>
