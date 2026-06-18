@@ -14,6 +14,20 @@ from typing import List, Optional
 
 from geopy.distance import geodesic
 from shapely.geometry import Polygon, Point
+from database import SessionLocal, engine, Base, SimulationRun, AlertLog
+from sqlalchemy.orm import Session
+from fastapi import Depends
+
+# This line physically creates the tables in PostgreSQL if they don't exist!
+Base.metadata.create_all(bind=engine)
+
+# Dependency to get the DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 app = FastAPI(title="SIMCORE v2.5 Backend")
 
@@ -27,6 +41,9 @@ app.add_middleware(
 # ==========================================================
 # PYDANTIC MODELS (React -> Python Data Structures)
 # ==========================================================
+class DatabaseSaveRequest(BaseModel):
+    scenarioName: str
+    alerts: List[dict]
 class DeviceModel(BaseModel):
     id: str
     type: str
@@ -242,3 +259,40 @@ async def generate_exports(payload: ExportRequest):
     kml += "\n</Document>\n</kml>"
 
     return {"csv_content": csv_io.getvalue(), "kml_content": kml}
+    # ==========================================================
+# ENDPOINT 3: SAVE RUN TO POSTGRESQL
+# ==========================================================
+@app.post("/api/database/save")
+async def save_to_database(payload: DatabaseSaveRequest, db: Session = Depends(get_db)):
+    try:
+        # 1. Save the Parent Run
+        db_run = SimulationRun(
+            scenario_name=payload.scenarioName,
+            total_alerts=len(payload.alerts),
+            timestamp=datetime.now(timezone.utc).isoformat()
+        )
+        db.add(db_run)
+        db.commit()
+        db.refresh(db_run) # Get the newly generated ID
+
+        # 2. Save all generated Alerts linked to that Run ID
+        for alert in payload.alerts:
+            db_alert = AlertLog(
+                run_id=db_run.id,
+                sensor_type=alert["sensor_type"],
+                sensor_name=alert["sensor_name"],
+                priority=alert["priority"],
+                latitude=alert["latitude"],
+                longitude=alert["longitude"],
+                distance_m=alert["distance_m"],
+                bearing=alert["bearing"],
+                timestamp=alert["timestamp"]
+            )
+            db.add(db_alert)
+        
+        db.commit()
+        return {"status": "success", "message": f"Saved as Run #{db_run.id}"}
+    
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "message": str(e)}

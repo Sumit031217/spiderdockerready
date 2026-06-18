@@ -336,10 +336,31 @@ const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, se
       if (currentAlert >= alertConfig.totalAlerts) {
         setIsRunning(false);
         setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `SYSTEM: Transmission Complete. ${alertConfig.totalAlerts} packets sent.`, type: 'info' }, ...prev]);
+        
+        // Save to React State for the Export Tab
         setCompletedRuns(prev => [...prev, {
           id: Date.now(), scenarioName: scenario.name, alertsGenerated: alertConfig.totalAlerts,
           timestamp: new Date().toLocaleString(), devices: activeFleet, alerts: generatedAlertsMemory
         }]);
+
+        // NEW: SEND TO POSTGRESQL DATABASE!
+        try {
+          setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `DATABASE: Committing payload to PostgreSQL...`, type: 'info' }, ...prev]);
+          fetch('http://127.0.0.1:8000/api/database/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scenarioName: scenario.name, alerts: generatedAlertsMemory })
+          })
+          .then(res => res.json())
+          .then(data => {
+            if(data.status === "success") {
+               setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `DATABASE: Successfully ${data.message}`, type: 'success' }, ...prev]);
+            }
+          });
+        } catch (e) {
+          setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `DATABASE ERROR: Could not reach Postgres.`, type: 'error' }, ...prev]);
+        }
+
         return;
       }
 
