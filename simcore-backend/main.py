@@ -14,16 +14,16 @@ from typing import List, Optional, Any
 
 from geopy.distance import geodesic
 from shapely.geometry import Polygon, Point
-from database import SessionLocal, engine, Base, SimulationRun, AlertLog, DeviceConfigDB, SchemaConfigDB, ScenarioStateDB, ActiveAlertDB
+from database import SessionLocal, engine, Base, SimulationRun, AlertLog, DeviceConfigDB, SchemaConfigDB, ScenarioStateDB, ActiveAlertDB, TelemetryLogDB
 from sqlalchemy.orm import Session
 from fastapi import Depends
 
 try:
     Base.metadata.create_all(bind=engine)
-    print("SUCCESS: Connected to PostgreSQL Database (simcore_db2).")
+    print("SUCCESS: Connected to PostgreSQL Database (simcore_db5).")
 except Exception as e:
     print("\nWARNING: Could not connect to PostgreSQL Database.")
-    print("Ensure you created 'simcore_db2' in pgAdmin!\n")
+    print("Ensure you created 'simcore_db5' in pgAdmin!\n")
 
 def get_db():
     db = SessionLocal()
@@ -39,6 +39,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class DatabaseSaveRequest(BaseModel):
     scenarioName: str
     alerts: List[dict]
+    devices: List[dict] = [] 
 
 class DeviceModel(BaseModel):
     id: str
@@ -50,7 +51,7 @@ class DeviceModel(BaseModel):
     azimuth: float
     fov: float
     alertCount: int = 0 
-    packetChoice: str = ""  # NEW FIELD ADDED
+    packetChoice: str = "" 
     isPolygon: bool = False
     polygon: Optional[list] = []
 
@@ -220,13 +221,19 @@ async def generate_exports(payload: ExportRequest):
 @app.post("/api/database/save")
 async def save_to_database(payload: DatabaseSaveRequest, db: Session = Depends(get_db)):
     try:
-        db_run = SimulationRun(scenario_name=payload.scenarioName, total_alerts=len(payload.alerts), timestamp=datetime.now(timezone.utc).isoformat())
+        db_run = SimulationRun(
+            scenario_name=payload.scenarioName, 
+            total_alerts=len(payload.alerts), 
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            devices_snapshot=json.dumps(payload.devices) 
+        )
         db.add(db_run); db.commit(); db.refresh(db_run) 
         for alert in payload.alerts:
             db_alert = AlertLog(
                 run_id=db_run.id, sensor_type=alert["sensor_type"], sensor_name=alert["sensor_name"],
-                priority=alert["priority"], latitude=alert["latitude"], longitude=alert["longitude"],
-                distance_m=alert["distance_m"], bearing=alert["bearing"], timestamp=alert["timestamp"]
+                alert_id=alert["alert_id"], priority=alert["priority"], latitude=alert["latitude"], 
+                longitude=alert["longitude"], distance_m=alert["distance_m"], bearing=alert["bearing"], 
+                timestamp=alert["timestamp"]
             )
             db.add(db_alert)
         db.commit()
@@ -234,6 +241,26 @@ async def save_to_database(payload: DatabaseSaveRequest, db: Session = Depends(g
     except Exception as e:
         db.rollback()
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/runs")
+def get_all_runs(db: Session = Depends(get_db)):
+    runs = db.query(SimulationRun).order_by(SimulationRun.id.desc()).all()
+    result = []
+    for r in runs:
+        alerts = [{
+            "sensor_type": a.sensor_type, "sensor_name": a.sensor_name, "alert_id": a.alert_id,
+            "priority": a.priority, "latitude": a.latitude, "longitude": a.longitude,
+            "distance_m": a.distance_m, "bearing": a.bearing, "timestamp": a.timestamp
+        } for a in r.alerts]
+        result.append({
+            "id": r.id,
+            "scenarioName": r.scenario_name,
+            "alertsGenerated": r.total_alerts,
+            "timestamp": r.timestamp,
+            "devices": json.loads(r.devices_snapshot) if r.devices_snapshot else [],
+            "alerts": alerts
+        })
+    return result
 
 # ==========================================================
 # DEVICE CONFIG PERSISTENCE
@@ -247,7 +274,7 @@ def get_saved_devices(db: Session = Depends(get_db)):
             "id": d.id, "type": d.type, "lat": d.lat, "lng": d.lng,
             "innerRange": d.innerRange, "outerRange": d.outerRange,
             "azimuth": d.azimuth, "fov": d.fov, "alertCount": d.alertCount,
-            "packetChoice": d.packetChoice, # RETURN FIELD
+            "packetChoice": d.packetChoice,
             "isPolygon": d.isPolygon, "polygon": json.loads(d.polygon) if d.polygon else []
         })
     return result
@@ -267,7 +294,7 @@ def save_devices(payload: List[DeviceModel], db: Session = Depends(get_db)):
                 db_dev.azimuth = float(dev.azimuth)
                 db_dev.fov = float(dev.fov)
                 db_dev.alertCount = int(dev.alertCount)
-                db_dev.packetChoice = str(dev.packetChoice) # SAVE FIELD
+                db_dev.packetChoice = str(dev.packetChoice)
                 db_dev.isPolygon = bool(dev.isPolygon)
                 db_dev.polygon = poly_str
             else:
@@ -275,7 +302,7 @@ def save_devices(payload: List[DeviceModel], db: Session = Depends(get_db)):
                     id=str(dev.id), type=str(dev.type), lat=float(dev.lat), lng=float(dev.lng),
                     innerRange=float(dev.innerRange), outerRange=float(dev.outerRange),
                     azimuth=float(dev.azimuth), fov=float(dev.fov), alertCount=int(dev.alertCount),
-                    packetChoice=str(dev.packetChoice), # SAVE FIELD
+                    packetChoice=str(dev.packetChoice),
                     isPolygon=bool(dev.isPolygon), polygon=poly_str
                 )
                 db.add(new_dev)
@@ -381,5 +408,31 @@ def save_active_alert(payload: dict, db: Session = Depends(get_db)):
 @app.delete("/api/state/alerts")
 def clear_active_alerts(db: Session = Depends(get_db)):
     db.query(ActiveAlertDB).delete()
+    db.commit()
+    return {"status": "success"}
+
+# ==========================================================
+# TELEMETRY LOG PERSISTENCE (NEW)
+# ==========================================================
+@app.get("/api/state/logs")
+def get_telemetry_logs(db: Session = Depends(get_db)):
+    # Returns in reverse ID order, so [0] is the newest log (matches React state)
+    logs = db.query(TelemetryLogDB).order_by(TelemetryLogDB.id.desc()).all()
+    return [{"time": l.time, "msg": l.msg, "type": l.type} for l in logs]
+
+@app.post("/api/state/logs")
+def save_telemetry_log(payload: dict, db: Session = Depends(get_db)):
+    new_log = TelemetryLogDB(
+        time=payload.get("time", ""),
+        msg=payload.get("msg", ""),
+        type=payload.get("type", "info")
+    )
+    db.add(new_log)
+    db.commit()
+    return {"status": "success"}
+
+@app.delete("/api/state/logs")
+def clear_telemetry_logs(db: Session = Depends(get_db)):
+    db.query(TelemetryLogDB).delete()
     db.commit()
     return {"status": "success"}

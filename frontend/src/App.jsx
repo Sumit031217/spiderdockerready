@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Shield, Settings, Server, MapPin, Trash2, CheckCircle, 
   Upload, Network, Clock, FileOutput, Save, BellDot, 
@@ -33,7 +33,6 @@ const getCameraFovPolygon = (lat, lng, radiusMeters, azimuth, fov) => {
 const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas }) => {
   const [status, setStatus] = useState({ message: 'System Ready', type: 'info' });
 
-  // EXPLICIT MANUAL DATABASE SYNC
   const syncDevicesToDB = async () => {
     try {
       const response = await fetch('http://127.0.0.1:8000/api/config/devices', {
@@ -82,7 +81,14 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
         text = text.replace(/,\s*([}\]])/g, '$1'); 
 
         const data = JSON.parse(text);
-        const parsedSensors = (Array.isArray(data) ? data : [data]).map(d => {
+        const dataArray = Array.isArray(data) ? data : [data];
+
+        const isValidFormat = dataArray.every(d => d.SensorId && d.SensorType && d.geometry);
+        if (!isValidFormat) {
+            throw new Error("Missing required fields. Each object must have a SensorId, SensorType, and geometry.");
+        }
+
+        const parsedSensors = dataArray.map(d => {
           let lng = 0, lat = 0, isPolygon = false, polygonArr = [];
           if (typeof d.geometry === 'string') {
             if (d.geometry.toUpperCase().includes('POLYGON')) {
@@ -109,10 +115,19 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
           };
         });
         
+        const missingSchemas = parsedSensors
+            .filter(d => d.packetChoice)
+            .map(d => d.packetChoice)
+            .filter(pc => !sensorSchemas.some(s => s.name.toUpperCase() === pc.toUpperCase()));
+
+        if (missingSchemas.length > 0) {
+            throw new Error(`The following Packet Formats are missing from the system: ${[...new Set(missingSchemas)].join(', ')}.\n\nPlease upload the correct Packet Format files BEFORE uploading this sensor array.`);
+        }
+
         setDevices(prev => [...prev, ...parsedSensors]);
         setStatus({ message: `Loaded ${parsedSensors.length} Sensors. Please click 'Save to DB'.`, type: 'info' });
       } catch (err) { 
-        alert(`🚨 JSON SYNTAX ERROR!\n\nThe browser crashed trying to read your file.\nDetails: ${err.message}`);
+        alert(`🚨 FORMAT ERROR!\n\nThe Sensor Array file was rejected.\nDetails: ${err.message}`);
       }
     };
     reader.readAsText(file);
@@ -125,19 +140,24 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
     reader.onload = (e) => {
       try {
         const parsedData = JSON.parse(e.target.result);
+        const dataArray = Array.isArray(parsedData) ? parsedData : [parsedData];
         
-        // Allows arrays of multiple schemas in a single file upload
-        const schemasToAdd = (Array.isArray(parsedData) ? parsedData : [parsedData]).map(item => ({
-            name: (item.protocolName || 'UNKNOWN').toUpperCase(),
+        const isValid = dataArray.every(item => item.protocolName && Array.isArray(item.fields));
+        if (!isValid) {
+            throw new Error("Missing 'protocolName' or 'fields' array. This is not a valid packet format schema.");
+        }
+
+        const schemasToAdd = dataArray.map(item => ({
+            name: item.protocolName.toUpperCase(),
             separator: item.separator || ',',
-            totalIndexes: item.fields ? item.fields.length : 0,
-            schema: item.fields || []
+            totalIndexes: item.fields.length,
+            schema: item.fields
         }));
         
         setSensorSchemas(prev => [...prev, ...schemasToAdd]);
         setStatus({ message: `Loaded ${schemasToAdd.length} Protocol Schemas. Please click 'Save to DB'.`, type: 'info' });
       } catch (err) { 
-        alert(`🚨 JSON SYNTAX ERROR!\n\nYour Packet Format JSON has a typo.\nDetails: ${err.message}`);
+        alert(`🚨 SCHEMA ERROR!\n\nYour Packet Format JSON was rejected.\nDetails: ${err.message}`);
       }
     };
     reader.readAsText(file);
@@ -370,85 +390,22 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices }) => {
 // ==========================================
 // MODULE 3: ALERT GENERATOR
 // ==========================================
-const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, setCompletedRuns, setActiveAlerts, sensorSchemas }) => {
-  const [isRunning, setIsRunning] = useState(false);
-  const [logs, setLogs] = useState([]);
-  const [progress, setProgress] = useState(0);
-
+const AlertGeneratorView = ({ 
+    devices, scenario, alertConfig, setAlertConfig, 
+    simIsRunning, simLogs, simProgress, startSimulation, stopSimulation, 
+    overrideCounts, setOverrideCounts, getAlertCount 
+}) => {
   const activeFleet = devices.filter(d => scenario.activeDevices.includes(d.id));
-  const environmentFleet = devices.filter(d => d.type === 'Environment');
-  const targetTotalAlerts = activeFleet.reduce((acc, dev) => acc + (dev.alertCount || 0), 0);
+  const targetTotalAlerts = activeFleet.reduce((acc, dev) => acc + getAlertCount(dev), 0);
 
   const handleChange = (e) => {
     const { name, value } = e.target;
     setAlertConfig(prev => ({ ...prev, [name]: parseFloat(value) }));
   };
 
-  const handleStartSimulation = () => {
-    if (activeFleet.length === 0) return alert("MISSION ABORT: No active sensors bound.");
-    if (targetTotalAlerts <= 0) return alert("MISSION ABORT: Bound sensors have an AlertCount of 0.");
-    
-    setIsRunning(true);
-    setLogs([{ time: new Date().toLocaleTimeString(), msg: `SYSTEM: Engaging '${scenario.name}'. UDP Engine Active.`, type: 'info' }]);
-    setProgress(0); setActiveAlerts([]); 
-    
-    fetch('http://127.0.0.1:8000/api/state/alerts', { method: 'DELETE' }).catch(console.error);
-
-    let executionPool = [];
-    activeFleet.forEach(dev => { for(let i = 0; i < (dev.alertCount || 0); i++) { executionPool.push(dev); } });
-    executionPool = executionPool.sort(() => Math.random() - 0.5);
-
-    let currentAlert = 0;
-    let generatedAlertsMemory = []; 
-    
-    const runTick = async () => {
-      if (currentAlert >= targetTotalAlerts) {
-        setIsRunning(false);
-        setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `SYSTEM: Transmission Complete. ${targetTotalAlerts} packets sent.`, type: 'info' }, ...prev]);
-        setCompletedRuns(prev => [...prev, { id: Date.now(), scenarioName: scenario.name, alertsGenerated: targetTotalAlerts, timestamp: new Date().toLocaleString(), devices: [...activeFleet, ...environmentFleet], alerts: generatedAlertsMemory }]);
-
-        try {
-          setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `DATABASE: Committing payload...`, type: 'info' }, ...prev]);
-          fetch('http://127.0.0.1:8000/api/database/save', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ scenarioName: scenario.name, alerts: generatedAlertsMemory })
-          }).then(res => res.json()).then(data => { if(data.status === "success") setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `DATABASE: ${data.message}`, type: 'success' }, ...prev]); });
-        } catch (e) { setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `DB ERROR: Postgres unreachable.`, type: 'error' }, ...prev]); }
-        return;
-      }
-
-      const dev = executionPool[currentAlert]; currentAlert++;
-      
-      // EXPLICIT MATCH: Maps PacketChoice to uploaded ProtocolName
-      const selectedSchema = sensorSchemas.find(s => s.name.toUpperCase() === (dev.packetChoice || "").toUpperCase()) || null;
-
-      try {
-        const response = await fetch('http://127.0.0.1:8000/api/transmit', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetIp: scenario.udpIp, targetPort: scenario.udpPort, trackId: currentAlert, device: dev, customSchema: selectedSchema ? selectedSchema.schema : null, customSeparator: selectedSchema ? selectedSchema.separator : "," })
-        });
-        const result = await response.json();
-        if (result.status === "success") {
-            generatedAlertsMemory.push(result.alert_data); setActiveAlerts(prev => [...prev, result.alert_data]);
-            
-            fetch('http://127.0.0.1:8000/api/state/alerts', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result.alert_data)
-            }).catch(()=>{});
-
-            setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `[${dev.id}] -> ${result.packet}`, type: 'success' }, ...prev]);
-        } else { setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `[ERROR] Python: ${result.message}`, type: 'error' }, ...prev]); }
-      } catch (error) { setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: `[ERROR] Engine Refused.`, type: 'error' }, ...prev]); }
-
-      setProgress(Math.floor((currentAlert / targetTotalAlerts) * 100));
-      const delay = Math.random() * (alertConfig.maxDelaySec - alertConfig.minDelaySec) + alertConfig.minDelaySec;
-      window.simTimeout = setTimeout(runTick, delay * 1000);
-    };
-    runTick();
-  };
-
-  const handleStopSimulation = () => {
-    clearTimeout(window.simTimeout); setIsRunning(false);
-    setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg: 'SYSTEM: Transmission Aborted.', type: 'error' }, ...prev]);
+  const handleCountOverride = (devId, val) => {
+    const num = parseInt(val, 10);
+    setOverrideCounts(prev => ({ ...prev, [devId]: isNaN(num) ? 0 : num }));
   };
 
   return (
@@ -458,34 +415,62 @@ const AlertGeneratorView = ({ devices, scenario, alertConfig, setAlertConfig, se
       </div>
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="space-y-6">
+          
+          <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm">
+            <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-4 flex items-center border-b border-slate-800 pb-2">
+              <Target className="w-4 h-4 mr-2 text-rose-400"/> Payload Overrides
+            </h3>
+            <div className="space-y-2 max-h-48 overflow-y-auto pr-2 mb-5">
+              {activeFleet.length === 0 ? (
+                 <div className="text-xs font-mono text-slate-500 bg-slate-950 p-3 rounded border border-slate-800">No active sensors bound in scenario.</div>
+              ) : (
+                 activeFleet.map(dev => (
+                   <div key={dev.id} className="flex items-center justify-between bg-slate-950 border border-slate-800 p-2 rounded">
+                     <div>
+                       <span className="text-sm font-bold text-slate-300">{dev.id}</span>
+                       <span className="text-[10px] text-slate-500 ml-2 uppercase">({dev.type})</span>
+                     </div>
+                     <input
+                       type="number" min="0"
+                       value={getAlertCount(dev)}
+                       onChange={(e) => handleCountOverride(dev.id, e.target.value)}
+                       disabled={simIsRunning}
+                       className="w-16 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-rose-400 font-mono text-center text-sm disabled:opacity-50 focus:border-rose-500 focus:outline-none"
+                     />
+                   </div>
+                 ))
+              )}
+            </div>
+            <div className="bg-slate-950 border border-slate-800 rounded px-3 py-3 text-center">
+               <span className="block text-xs font-mono text-slate-500 mb-1">Target Mission Payload</span>
+               <span className="text-2xl text-rose-400 font-bold">{targetTotalAlerts} Packets</span>
+            </div>
+          </div>
+
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm">
             <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-5 flex items-center border-b border-slate-800 pb-2"><Sliders className="w-4 h-4 mr-2 text-cyan-400"/> Transmission Parameters</h3>
             <div className="space-y-4 mb-6">
-              <div className="bg-slate-950 border border-slate-800 rounded px-3 py-3 text-center">
-                 <span className="block text-xs font-mono text-slate-500 mb-1">Target Mission Payload</span>
-                 <span className="text-2xl text-rose-400 font-bold">{targetTotalAlerts} Packets</span>
-              </div>
               <div>
                 <label className="block text-xs font-mono text-slate-500 mb-1 flex items-center"><Clock className="w-3 h-3 mr-1 text-amber-400"/> Timing Physics (Seconds)</label>
                 <div className="grid grid-cols-2 gap-3">
-                  <input type="number" step="0.1" name="minDelaySec" value={alertConfig.minDelaySec} onChange={handleChange} disabled={isRunning} placeholder="Min" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50" />
-                  <input type="number" step="0.1" name="maxDelaySec" value={alertConfig.maxDelaySec} onChange={handleChange} disabled={isRunning} placeholder="Max" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50" />
+                  <input type="number" step="0.1" name="minDelaySec" value={alertConfig.minDelaySec} onChange={handleChange} disabled={simIsRunning} placeholder="Min" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
+                  <input type="number" step="0.1" name="maxDelaySec" value={alertConfig.maxDelaySec} onChange={handleChange} disabled={simIsRunning} placeholder="Max" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
                 </div>
               </div>
             </div>
             <div className="mb-6">
-              <div className="flex justify-between text-xs font-mono mb-1 text-slate-400"><span>Progress</span><span>{progress}%</span></div>
-              <div className="w-full bg-slate-950 rounded-full h-2 border border-slate-800"><div className="bg-rose-500 h-full rounded-full transition-all duration-300" style={{ width: `${progress}%` }}></div></div>
+              <div className="flex justify-between text-xs font-mono mb-1 text-slate-400"><span>Progress</span><span>{simProgress}%</span></div>
+              <div className="w-full bg-slate-950 rounded-full h-2 border border-slate-800"><div className="bg-rose-500 h-full rounded-full transition-all duration-300" style={{ width: `${simProgress}%` }}></div></div>
             </div>
-            {!isRunning ? ( <button onClick={handleStartSimulation} className="w-full flex justify-center items-center space-x-2 bg-rose-600 hover:bg-rose-500 text-white font-bold py-3 rounded text-sm shadow-lg"><Play className="w-4 h-4 fill-current" /> <span>ENGAGE TRANSMITTER</span></button> ) : (
-              <button onClick={handleStopSimulation} className="w-full flex justify-center items-center space-x-2 bg-slate-700 hover:bg-slate-600 text-white font-bold py-3 rounded text-sm shadow-lg animate-pulse"><Square className="w-4 h-4 fill-current" /> <span>ABORT</span></button> )}
+            {!simIsRunning ? ( <button onClick={startSimulation} className="w-full flex justify-center items-center space-x-2 bg-rose-600 hover:bg-rose-500 text-white font-bold py-3 rounded text-sm shadow-lg"><Play className="w-4 h-4 fill-current" /> <span>ENGAGE TRANSMITTER</span></button> ) : (
+              <button onClick={stopSimulation} className="w-full flex justify-center items-center space-x-2 bg-slate-700 hover:bg-slate-600 text-white font-bold py-3 rounded text-sm shadow-lg animate-pulse"><Square className="w-4 h-4 fill-current" /> <span>ABORT</span></button> )}
           </div>
         </div>
         <div className="xl:col-span-2">
           <div className="bg-[#0A0A0A] border border-slate-800 rounded-lg h-full flex flex-col overflow-hidden shadow-2xl relative">
             <div className="bg-slate-900 border-b border-slate-800 px-5 py-3 flex justify-between items-center z-10"><h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center font-mono"><Terminal className="w-4 h-4 mr-2 text-slate-500"/> Live UDP Telemetry</h3></div>
             <div className="flex-1 overflow-y-auto p-4 font-mono text-[11px] leading-relaxed space-y-1">
-              {logs.length === 0 ? <div className="text-slate-600 mt-2">Waiting for simulation to begin...</div> : logs.map((log, idx) => (<div key={idx} className={`flex space-x-3 ${log.type === 'error' ? 'text-rose-400' : log.type === 'info' ? 'text-cyan-400' : 'text-emerald-400'}`}><span className="opacity-50 shrink-0">[{log.time}]</span><span className="break-all">{log.msg}</span></div>))}
+              {simLogs.length === 0 ? <div className="text-slate-600 mt-2">Waiting for simulation to begin...</div> : simLogs.map((log, idx) => (<div key={idx} className={`flex space-x-3 ${log.type === 'error' ? 'text-rose-400' : log.type === 'info' ? 'text-cyan-400' : 'text-emerald-400'}`}><span className="opacity-50 shrink-0">[{log.time}]</span><span className="break-all">{log.msg}</span></div>))}
             </div>
           </div>
         </div>
@@ -599,32 +584,139 @@ export default function App() {
   const [alertConfig, setAlertConfig] = useState({ minDelaySec: 0.1, maxDelaySec: 0.5 });
   const [completedRuns, setCompletedRuns] = useState([]);
   const [activeAlerts, setActiveAlerts] = useState([]);
+  
+  const [simIsRunning, setSimIsRunning] = useState(false);
+  const [simLogs, setSimLogs] = useState([]);
+  const [simProgress, setSimProgress] = useState(0);
+  const [overrideCounts, setOverrideCounts] = useState({});
+  const engineRef = useRef({ isRunning: false, currentAlert: 0, targetTotalAlerts: 0, executionPool: [], generatedAlertsMemory: [], timeout: null });
 
-  // ==========================================
-  // DB ONLY: FULL BOOT-UP SEQUENCE
-  // ==========================================
+  const getAlertCount = (dev) => overrideCounts[dev.id] !== undefined ? overrideCounts[dev.id] : (dev.alertCount || 0);
+
+  // LOG PERSISTENCE HELPER: Writes to React Array AND Database simultaneously
+  const addLog = (msg, type) => {
+    const timeStr = new Date().toLocaleTimeString();
+    const newLog = { time: timeStr, msg, type };
+    setSimLogs(prev => [newLog, ...prev]);
+    fetch('http://127.0.0.1:8000/api/state/logs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newLog)
+    }).catch(()=>{});
+  };
+
+  const fetchHistory = () => {
+    fetch('http://127.0.0.1:8000/api/runs')
+      .then(res => res.json()).then(data => { if(Array.isArray(data)) setCompletedRuns(data); })
+      .catch(e => console.error("History fetch failed"));
+  };
+
   useEffect(() => {
-    // Health Check & Schema Fetch
     fetch('http://127.0.0.1:8000/api/config/schemas')
-      .then(res => {
-          if (res.ok) { setDbStatus('CONNECTED'); return res.json(); }
-          throw new Error("Bad Response");
-      })
+      .then(res => { if (res.ok) { setDbStatus('CONNECTED'); return res.json(); } throw new Error(); })
       .then(data => { if(Array.isArray(data)) setSensorSchemas(data); })
       .catch(e => setDbStatus('DISCONNECTED'));
 
     fetch('http://127.0.0.1:8000/api/config/devices')
-      .then(res => res.json()).then(data => { if(Array.isArray(data)) setDevices(data); })
-      .catch(e => console.error("Devices empty"));
+      .then(res => res.json()).then(data => { if(Array.isArray(data)) setDevices(data); }).catch(e => console.error(e));
       
     fetch('http://127.0.0.1:8000/api/state/scenario')
-      .then(res => res.json()).then(data => { if(data && data.name) setScenario(data); })
-      .catch(e => console.error("Scenario empty"));
+      .then(res => res.json()).then(data => { if(data && data.name) setScenario(data); }).catch(e => console.error(e));
       
     fetch('http://127.0.0.1:8000/api/state/alerts')
-      .then(res => res.json()).then(data => { if(Array.isArray(data)) setActiveAlerts(data); })
-      .catch(e => console.error("Alerts empty"));
+      .then(res => res.json()).then(data => { if(Array.isArray(data)) setActiveAlerts(data); }).catch(e => console.error(e));
+      
+    // FETCH TELEMETRY LOGS ON LOAD
+    fetch('http://127.0.0.1:8000/api/state/logs')
+      .then(res => res.json()).then(data => { if(Array.isArray(data)) setSimLogs(data); }).catch(e => console.error(e));
+
+    fetchHistory();
   }, []);
+
+  const startSimulation = () => {
+    const activeFleet = devices.filter(d => scenario.activeDevices.includes(d.id));
+    const environmentFleet = devices.filter(d => d.type === 'Environment');
+    const targetTotalAlerts = activeFleet.reduce((acc, dev) => acc + getAlertCount(dev), 0);
+
+    if (activeFleet.length === 0) return alert("MISSION ABORT: No active sensors bound.");
+    if (targetTotalAlerts <= 0) return alert("MISSION ABORT: Target payload is 0.");
+
+    fetch('http://127.0.0.1:8000/api/state/alerts', { method: 'DELETE' }).catch(console.error);
+    fetch('http://127.0.0.1:8000/api/state/logs', { method: 'DELETE' }).catch(console.error); 
+
+    let pool = [];
+    activeFleet.forEach(dev => { 
+        const count = getAlertCount(dev);
+        for(let i = 0; i < count; i++) { pool.push(dev); } 
+    });
+    pool = pool.sort(() => Math.random() - 0.5);
+
+    engineRef.current = { isRunning: true, currentAlert: 0, targetTotalAlerts, executionPool: pool, generatedAlertsMemory: [], timeout: null };
+    setSimIsRunning(true);
+    setSimProgress(0);
+    setActiveAlerts([]);
+    setSimLogs([]); 
+    
+    addLog(`SYSTEM: Engaging '${scenario.name}'. UDP Engine Active.`, 'info');
+
+    const runTick = async () => {
+      if (!engineRef.current.isRunning) return;
+
+      if (engineRef.current.currentAlert >= engineRef.current.targetTotalAlerts) {
+        setSimIsRunning(false);
+        engineRef.current.isRunning = false;
+        addLog(`SYSTEM: Transmission Complete. ${engineRef.current.targetTotalAlerts} packets sent.`, 'info');
+        
+        try {
+          addLog(`DATABASE: Committing payload...`, 'info');
+          const response = await fetch('http://127.0.0.1:8000/api/database/save', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scenarioName: scenario.name, alerts: engineRef.current.generatedAlertsMemory, devices: activeFleet.concat(environmentFleet) })
+          });
+          const data = await response.json();
+          if (data.status === "success") {
+              addLog(`DATABASE: ${data.message}`, 'success');
+              fetchHistory(); 
+          }
+        } catch (e) { addLog(`DB ERROR: Postgres unreachable.`, 'error'); }
+        return;
+      }
+
+      const dev = engineRef.current.executionPool[engineRef.current.currentAlert]; 
+      engineRef.current.currentAlert++;
+      const selectedSchema = sensorSchemas.find(s => s.name.toUpperCase() === (dev.packetChoice || "").toUpperCase()) || null;
+
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/transmit', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetIp: scenario.udpIp, targetPort: scenario.udpPort, trackId: engineRef.current.currentAlert, device: dev, customSchema: selectedSchema ? selectedSchema.schema : null, customSeparator: selectedSchema ? selectedSchema.separator : "," })
+        });
+        const result = await response.json();
+        if (result.status === "success" && engineRef.current.isRunning) {
+            engineRef.current.generatedAlertsMemory.push(result.alert_data);
+            setActiveAlerts(prev => [...prev, result.alert_data]);
+            
+            fetch('http://127.0.0.1:8000/api/state/alerts', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result.alert_data)
+            }).catch(()=>{});
+
+            addLog(`[${dev.id}] -> ${result.packet}`, 'success');
+        } else { addLog(`[ERROR] Python: ${result.message}`, 'error'); }
+      } catch (error) { if (engineRef.current.isRunning) addLog(`[ERROR] Engine Refused.`, 'error'); }
+
+      if (engineRef.current.isRunning) {
+          setSimProgress(Math.floor((engineRef.current.currentAlert / engineRef.current.targetTotalAlerts) * 100));
+          const delay = Math.random() * (alertConfig.maxDelaySec - alertConfig.minDelaySec) + alertConfig.minDelaySec;
+          engineRef.current.timeout = setTimeout(runTick, delay * 1000);
+      }
+    };
+    runTick();
+  };
+
+  const stopSimulation = () => {
+    clearTimeout(engineRef.current.timeout); 
+    engineRef.current.isRunning = false;
+    setSimIsRunning(false);
+    addLog('SYSTEM: Transmission Aborted.', 'error');
+  };
 
   const menuItems = [
     { name: 'Device Configuration', icon: Settings },
@@ -655,14 +747,14 @@ export default function App() {
                 <span className={`w-2 h-2 rounded-full ${dbStatus === 'CONNECTED' ? 'bg-emerald-500' : 'bg-rose-500'}`}></span>
                 <span>DB: {dbStatus}</span>
             </div>
-            <div className="flex items-center space-x-2 px-3 py-1.5 rounded-md bg-slate-950 border border-slate-800 font-mono text-xs"><span className="w-2 h-2 rounded-full bg-amber-500"></span><span className="text-slate-300">ENGINE: IDLE</span></div>
+            <div className="flex items-center space-x-2 px-3 py-1.5 rounded-md bg-slate-950 border border-slate-800 font-mono text-xs"><span className={`w-2 h-2 rounded-full ${simIsRunning ? 'bg-rose-500 animate-pulse' : 'bg-amber-500'}`}></span><span className="text-slate-300">ENGINE: {simIsRunning ? 'TRANSMITTING' : 'IDLE'}</span></div>
           </div>
         </header>
         <div className="flex-1 overflow-y-auto">
           {currentView === 'Device Configuration' && <DeviceConfigView devices={devices} setDevices={setDevices} sensorSchemas={sensorSchemas} setSensorSchemas={setSensorSchemas} />}
           {currentView === 'Scenario Builder' && <ScenarioBuilderView devices={devices} scenario={scenario} setScenario={setScenario} />}
           {currentView === 'Tactical Map' && <MapView devices={devices} alerts={activeAlerts} />}
-          {currentView === 'Alert Generator' && <AlertGeneratorView devices={devices} scenario={scenario} alertConfig={alertConfig} setAlertConfig={setAlertConfig} setCompletedRuns={setCompletedRuns} setActiveAlerts={setActiveAlerts} sensorSchemas={sensorSchemas} />}
+          {currentView === 'Alert Generator' && <AlertGeneratorView devices={devices} scenario={scenario} alertConfig={alertConfig} setAlertConfig={setAlertConfig} setCompletedRuns={setCompletedRuns} setActiveAlerts={setActiveAlerts} sensorSchemas={sensorSchemas} simIsRunning={simIsRunning} simLogs={simLogs} simProgress={simProgress} startSimulation={startSimulation} stopSimulation={stopSimulation} overrideCounts={overrideCounts} setOverrideCounts={setOverrideCounts} getAlertCount={getAlertCount} />}
           {currentView === 'Reports / Export' && <ExportView completedRuns={completedRuns} />}
         </div>
       </main>

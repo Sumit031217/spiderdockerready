@@ -1,0 +1,12 @@
+{
+  "protocolName": "RADARsddkjfdsjkfg",
+  "separator": ",",
+  "fields": [
+    { "index": 0, "name": "DeviceId", "dataType": "String" },
+    { "index": 1, "name": "DeviceType", "dataType": "Integer", "staticValue": "9" },
+    { "index": 2, "name": "DeviceLat", "dataType": "Float/Double" },
+    { "index": 3, "name": "DeviceLong", "dataType": "Float/Double" },
+    { "index": 4, "name": "DeviceHeight", "dataType": "Integer", "staticValue": "0" }
+
+  ]
+}

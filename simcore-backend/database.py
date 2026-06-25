@@ -2,8 +2,8 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
-# CHANGED TO simcore_db2 TO FORCE A CLEAN TABLE GENERATION FOR THE NEW COLUMNS
-SQLALCHEMY_DATABASE_URL = "postgresql://postgres:702073@localhost:5432/simcore_db2"
+# MOVED TO simcore_db5 TO AUTO-GENERATE THE NEW TELEMETRY TABLE
+SQLALCHEMY_DATABASE_URL = "postgresql://postgres:702073@localhost:5432/simcore_db5"
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -18,6 +18,7 @@ class SimulationRun(Base):
     scenario_name = Column(String, index=True)
     total_alerts = Column(Integer)
     timestamp = Column(String)
+    devices_snapshot = Column(Text, default="[]") 
     alerts = relationship("AlertLog", back_populates="run")
 
 class AlertLog(Base):
@@ -26,6 +27,7 @@ class AlertLog(Base):
     run_id = Column(Integer, ForeignKey("simulation_runs.id"))
     sensor_type = Column(String)
     sensor_name = Column(String)
+    alert_id = Column(Integer) 
     priority = Column(String)
     latitude = Column(Float)
     longitude = Column(Float)
@@ -48,7 +50,7 @@ class DeviceConfigDB(Base):
     azimuth = Column(Float)
     fov = Column(Float)
     alertCount = Column(Integer)
-    packetChoice = Column(String)  # NEW COLUMN ADDED
+    packetChoice = Column(String)
     isPolygon = Column(Boolean)
     polygon = Column(Text)  
 
@@ -82,3 +84,10 @@ class ActiveAlertDB(Base):
     distance_m = Column(Float)
     bearing = Column(Float)
     timestamp = Column(String)
+
+class TelemetryLogDB(Base):
+    __tablename__ = "telemetry_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    time = Column(String)
+    msg = Column(String)
+    type = Column(String)
