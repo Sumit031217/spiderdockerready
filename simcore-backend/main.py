@@ -5,40 +5,35 @@ import random
 import socket
 import time
 import threading
-import sys
-import os
 from io import StringIO
 from datetime import datetime, timezone
+from collections import deque
 
 from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any
+from typing import List, Optional
 
 from geopy.distance import geodesic
 from shapely.geometry import Polygon as ShapelyPolygon, LineString as ShapelyLineString, Point as ShapelyPoint
-from database import SessionLocal, engine, Base, SimulationRun, AlertLog, DeviceConfigDB, SchemaConfigDB, ScenarioStateDB
 from sqlalchemy.orm import Session
+from sqlalchemy import text
+
+from database import SessionLocal, engine, Base, SimulationRun, AlertLog, DeviceConfigDB, SchemaConfigDB, ScenarioStateDB
 
 # ==========================================================
-# SAFE MODULE LOADER FOR ALERT ENGINE (MUST BE HERE!)
+# DATABASE INITIALIZATION & SILENT MIGRATION
 # ==========================================================
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-try:
-    from src.alert_engine import AlertEngine
-except ModuleNotFoundError:
-    try:
-        from alert_engine import AlertEngine
-    except ModuleNotFoundError:
-        raise RuntimeError(
-            "CRITICAL: Could not find 'alert_engine.py'. Ensure it is saved in simcore-backend/"
-        )
-# ==========================================================
-
 try:
     Base.metadata.create_all(bind=engine)
     print("SUCCESS: Connected to PostgreSQL Database.")
+    with engine.begin() as conn:
+        try: conn.execute(text("ALTER TABLE device_configs ADD COLUMN envcategory VARCHAR DEFAULT 'GENERAL';"))
+        except: pass
+        try: conn.execute(text("ALTER TABLE device_configs ADD COLUMN color VARCHAR DEFAULT '#3b82f6';"))
+        except: pass
+        try: conn.execute(text("ALTER TABLE device_configs ADD COLUMN sourcefile VARCHAR DEFAULT 'Uploaded KML';"))
+        except: pass
 except Exception as e:
     print("\nWARNING: Could not connect to PostgreSQL Database:", e)
 
@@ -63,12 +58,6 @@ engine_state = {
     "map_alerts": []
 }
 
-# Line 64: This will now succeed because AlertEngine is imported right above!
-alert_engine = AlertEngine(max_queue_size=50000)
-
-# ==========================================================
-# PYDANTIC MODELS
-# ==========================================================
 class DeviceModel(BaseModel):
     id: str
     type: str
@@ -82,8 +71,9 @@ class DeviceModel(BaseModel):
     packetChoice: str = "" 
     isPolygon: bool = False
     polygon: Optional[list] = []
-    envCategory: Optional[str] = ""
-    color: Optional[str] = "#888888"
+    envCategory: Optional[str] = "GENERAL"
+    color: Optional[str] = "#3b82f6"
+    sourceFile: Optional[str] = "Uploaded KML"
 
 class SchemaModel(BaseModel):
     name: str
@@ -96,11 +86,6 @@ class ScenarioModel(BaseModel):
     activeDevices: list
     udpIp: str
     udpPort: int
-
-class ExportRequest(BaseModel):
-    scenarioName: str
-    devices: List[DeviceModel]
-    alerts: List[dict]
 
 class RangeExportRequest(BaseModel):
     startTime: str
@@ -115,9 +100,6 @@ def determine_priority(distance):
     if distance <= 3500: return "MEDIUM"
     return "LOW"
 
-# ==========================================================
-# DYNAMIC PACKET BUILDER
-# ==========================================================
 def build_dynamic_packet(alert, device, track_id, schema, separator):
     clean_type = str(device.type).upper()
     if not schema:
@@ -131,7 +113,7 @@ def build_dynamic_packet(alert, device, track_id, schema, separator):
         else: 
             fov_start = (device.azimuth - (device.fov / 2)) % 360
             fov_end = (device.azimuth + (device.fov / 2)) % 360
-            packet = [clean_id, 9, round(device.lat, 6), round(device.lng, 6), 0, round(device.azimuth, 2), round(fov_start, 2), round(fov_end, 2), track_id, round(alert["loc"][0], 8), round(alert["loc"][1], 8), round(alert.get("distance_m", 0), 2), round(alert.get("bearing", 0), 2), 0, 95, int(time.time()), 0, "", 0, 0, 0]
+            packet = [clean_id, 9, round(device.lat, 6), round(device.lng, 6), 0, round(device.azimuth, 2), round(fov_start, 2), round(fov_end, 2), track_id, round(alert["latitude"], 8), round(alert["longitude"], 8), round(alert.get("distance_m", 0), 2), round(alert.get("bearing", 0), 2), 0, 95, int(time.time()), 0, "", 0, 0, 0]
             return ",".join(map(str, packet))
 
     packet = []
@@ -149,8 +131,8 @@ def build_dynamic_packet(alert, device, track_id, schema, separator):
         elif 'devicetype' in fname or 'sensortype' in fname: val = 9 if "RADAR" in clean_type else 10 if "CAM" in clean_type else 11
         elif 'devicelat' in fname or ('lat' in fname and 'target' not in fname): val = round(device.lat, 6)
         elif 'devicelong' in fname or 'devicelng' in fname or ('lon' in fname and 'target' not in fname): val = round(device.lng, 6)
-        elif 'targetlat' in fname or 'alertlat' in fname: val = round(alert["loc"][0], 8)
-        elif 'targetlong' in fname or 'alertlong' in fname: val = round(alert["loc"][1], 8)
+        elif 'targetlat' in fname or 'alertlat' in fname: val = round(alert["latitude"], 8)
+        elif 'targetlong' in fname or 'alertlong' in fname: val = round(alert["longitude"], 8)
         elif 'range' in fname or 'distance' in fname: val = round(alert.get("distance_m", 0), 2)
         elif 'bearing' in fname and 'device' not in fname: val = round(alert.get("bearing", 0), 2)
         elif 'trackid' in fname or 'nodeid' in fname: val = track_id
@@ -170,9 +152,6 @@ def build_dynamic_packet(alert, device, track_id, schema, separator):
         packet.append(str(val))
     return separator.join(packet)
 
-# ==========================================================
-# SPATIAL REJECTION SAMPLING HELPER
-# ==========================================================
 def build_spatial_indices(env_devices):
     perimeters, buildings, vegetations, waterbodies, transport_lines = [], [], [], [], []
     for env in env_devices:
@@ -256,12 +235,31 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         with engine_lock: engine_state['is_running'] = False
         return
 
+    db = SessionLocal()
+    run_id = None
+    try:
+        db_run = SimulationRun(
+            scenario_name=scenarioName, total_alerts=total, 
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            devices_snapshot=json.dumps(active_devices + env_devices) 
+        )
+        db.add(db_run)
+        db.commit()
+        db.refresh(db_run)
+        run_id = db_run.id
+    except Exception as e:
+        with engine_lock:
+            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB START ERROR: {str(e)}", "type": "error"})
+
     perimeters, buildings, vegetations, waterbodies, transport_lines = build_spatial_indices(env_devices)
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    # Dynamic UI batch step: updates every 1 packet if small burst (<50), else scales up to 25
     batch_step = 1 if total < 50 else min(25, max(1, total // 100))
     class DummyDev: pass
+
+    # [FIX 1] UI Deque + Chunk DB Saving guarantees 0 memory bloat and cleans old alerts instantly
+    ui_alerts = deque(maxlen=1000)
+    db_chunk = []
 
     for idx, dev_dict in enumerate(pool):
         with engine_lock:
@@ -283,37 +281,42 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         d_obj.packetChoice = dev_dict.get('packetChoice', '')
 
         alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, perimeters, buildings, vegetations, waterbodies, transport_lines)
-
-        # [INTEGRATION] Use AlertEngine to emit ultra-lightweight alert reference (<200 bytes)
-        alert_data = alert_engine.emit_alert(
-            alert_type=str(d_obj.type).upper(),
-            timestamp=time.time(),
-            layer_id=scenarioName,
-            feature_id=d_obj.id,
-            trigger_lat=alert_lat,
-            trigger_lon=alert_lng
-        )
-        alert_data["priority"] = priority
-        alert_data["distance_m"] = dist
-        alert_data["bearing"] = bearing
-        alert_data["sensor_name"] = d_obj.id
-        alert_data["sensor_type"] = str(d_obj.type).upper()
-        alert_data["alert_id"] = idx + 1
-        alert_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        track_id = idx + 1
+        
+        alert_data = {
+            "run_id": run_id,
+            "sensor_type": str(d_obj.type).upper(),
+            "sensor_name": d_obj.id,
+            "alert_id": track_id,
+            "priority": priority,
+            "latitude": alert_lat,
+            "longitude": alert_lng,
+            "distance_m": dist,
+            "bearing": bearing,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        ui_alerts.append(alert_data)
+        db_chunk.append(alert_data)
 
         sel_schema = next((s['schema'] for s in schemas if s['name'].upper() == str(d_obj.packetChoice).upper()), None)
         sel_sep = next((s['separator'] for s in schemas if s['name'].upper() == str(d_obj.packetChoice).upper()), ",")
 
-        packet_string = build_dynamic_packet(alert_data, d_obj, idx + 1, sel_schema, sel_sep)
+        packet_string = build_dynamic_packet(alert_data, d_obj, track_id, sel_schema, sel_sep)
         try:
             udp_socket.sendto(packet_string.encode('utf-8'), (str(udpIp), int(udpPort)))
         except Exception: pass
 
+        # Database chunking completely prevents high RAM usage
+        if len(db_chunk) >= 5000:
+            db.bulk_insert_mappings(AlertLog, db_chunk)
+            db.commit()
+            db_chunk.clear()
+
         if idx % batch_step == 0 or idx == total - 1:
             with engine_lock:
                 engine_state['progress'] = idx + 1
-                # Sync UI map strictly with last 1000 items in queue
-                engine_state['map_alerts'] = alert_engine.alert_queue[-1000:]
+                engine_state['map_alerts'] = list(ui_alerts)
                 engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"[{d_obj.id}] -> {packet_string}", "type": "success"})
                 if len(engine_state['logs']) > 50:
                     engine_state['logs'] = engine_state['logs'][:50]
@@ -323,46 +326,18 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
 
     udp_socket.close()
 
+    # Final DB chunk flush
+    if db_chunk:
+        db.bulk_insert_mappings(AlertLog, db_chunk)
+        db.commit()
+        db_chunk.clear()
+
     if not engine_state['should_abort']:
         with engine_lock:
             engine_state['progress'] = total
-            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Transmission Complete. {total} packets sent.", "type": "info"})
-            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DATABASE: Writing batch records to PostgreSQL...", "type": "info"})
+            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Transmission Complete. {total} packets sent and committed to DB.", "type": "info"})
 
-        db = SessionLocal()
-        try:
-            db_run = SimulationRun(
-                scenario_name=scenarioName, total_alerts=total, 
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                devices_snapshot=json.dumps(active_devices + env_devices) 
-            )
-            db.add(db_run)
-            db.commit()
-            db.refresh(db_run)
-
-            # Flush remaining queue directly to database mappings
-            chunk_size = 5000
-            all_generated = alert_engine.alert_queue
-            alert_dicts = []
-            for a in all_generated:
-                alert_dicts.append({
-                    "run_id": db_run.id, "sensor_type": a["sensor_type"], "sensor_name": a["sensor_name"],
-                    "alert_id": a["alert_id"], "priority": a["priority"], "latitude": a["loc"][0],
-                    "longitude": a["loc"][1], "distance_m": a["distance_m"], "bearing": a["bearing"], "timestamp": a["timestamp"]
-                })
-
-            for i in range(0, len(alert_dicts), chunk_size):
-                db.bulk_insert_mappings(AlertLog, alert_dicts[i:i+chunk_size])
-            db.commit()
-
-            with engine_lock:
-                engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": "DATABASE: Successfully wrote 100% of data to Postgres history.", "type": "success"})
-
-        except Exception as e:
-            with engine_lock:
-                engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB ERROR: {str(e)}", "type": "error"})
-        finally: db.close()
-
+    db.close()
     with engine_lock:
         engine_state['is_running'] = False
 
@@ -375,6 +350,7 @@ def api_engine_start(payload: dict):
         engine_state["is_running"] = True
         engine_state["progress"] = 0
         engine_state["total"] = sum(int(d.get("alertCount", 0)) for d in payload.get("activeDevices", []))
+        engine_state["map_alerts"] = []
 
     t = threading.Thread(
         target=simulation_worker,
@@ -401,15 +377,17 @@ def api_engine_stop():
     with engine_lock: engine_state["should_abort"] = True
     return {"status": "success"}
 
+# [FIX 2] Hard cap visual map return array to protect browser memory while retaining real data
 @app.get("/api/state/alerts")
 def get_active_alerts(db: Session = Depends(get_db)):
     last_run = db.query(SimulationRun).order_by(SimulationRun.id.desc()).first()
     if last_run:
+        alerts_query = db.query(AlertLog).filter(AlertLog.run_id == last_run.id).order_by(AlertLog.id.desc()).limit(1000).all()
         return [{
             "sensor_type": a.sensor_type, "sensor_name": a.sensor_name, "alert_id": a.alert_id,
             "priority": a.priority, "latitude": a.latitude, "longitude": a.longitude,
             "distance_m": a.distance_m, "bearing": a.bearing, "timestamp": a.timestamp
-        } for a in last_run.alerts]
+        } for a in alerts_query]
     return []
 
 def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
@@ -417,7 +395,7 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
     writer = csv.writer(csv_io)
     writer.writerow(["sensor_type", "sensor_name", "alert_id", "priority", "latitude", "longitude", "distance_m", "bearing", "timestamp"])
     for alert in alerts:
-        writer.writerow([alert["sensor_type"], alert["sensor_name"], alert["alert_id"], alert["priority"], alert.get("latitude", alert.get("loc", [0,0])[0]), alert.get("longitude", alert.get("loc", [0,0])[1]), alert.get("distance_m", 0), alert.get("bearing", 0), alert["timestamp"]])
+        writer.writerow([alert["sensor_type"], alert["sensor_name"], alert["alert_id"], alert["priority"], alert.get("latitude", 0), alert.get("longitude", 0), alert.get("distance_m", 0), alert.get("bearing", 0), alert["timestamp"]])
     
     kml = f'<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n    <name>{report_name}</name>\n    <Style id="radarStyle"><IconStyle><color>ff0000ff</color><scale>1.4</scale></IconStyle></Style>\n    <Style id="cameraStyle"><IconStyle><color>ffff0000</color><scale>1.4</scale></IconStyle></Style>\n    <Style id="radarHighStyle"><IconStyle><color>ff0000ff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="radarMediumStyle"><IconStyle><color>ff00ffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="radarLowStyle"><IconStyle><color>ff00ff00</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="cameraHighStyle"><IconStyle><color>ffffffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="cameraMediumStyle"><IconStyle><color>ffffffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="cameraLowStyle"><IconStyle><color>ffffffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="pidsAlertStyle"><IconStyle><color>ffffff00</color><scale>1.3</scale></IconStyle></Style>\n'
     
@@ -431,9 +409,14 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
         if "ENV" in clean_type:
             hex_color = dev.get("color", "#888888").lstrip("#")
             kml_color = "ff" + hex_color[4:6] + hex_color[2:4] + hex_color[0:2]
+            is_line = dev.get("envCategory") in ["ROAD", "RAILWAY"]
+            
             if len(polygon) >= 2:
                 coords_str = " ".join([f"{pt[1]},{pt[0]},0" for pt in polygon])
-                kml += f'<Placemark><name>{dev_id}</name><Style><LineStyle><color>{kml_color}</color><width>2.5</width></LineStyle><PolyStyle><color>66{kml_color[2:]}</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>{coords_str}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
+                if is_line:
+                    kml += f'<Placemark><name>{dev_id}</name><Style><LineStyle><color>{kml_color}</color><width>2.5</width></LineStyle></Style><LineString><coordinates>{coords_str}</coordinates></LineString></Placemark>'
+                else:
+                    kml += f'<Placemark><name>{dev_id}</name><Style><LineStyle><color>{kml_color}</color><width>2.5</width></LineStyle><PolyStyle><color>66{kml_color[2:]}</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>{coords_str}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
             else:
                 kml += f'<Placemark><name>{dev_id}</name><Point><coordinates>{lng},{lat},0</coordinates></Point></Placemark>'
         elif dev.get("isPolygon") and polygon:
@@ -468,52 +451,41 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
         if "RADAR" in clean_type: style = "#radarHighStyle" if alert["priority"] == "HIGH" else "#radarMediumStyle" if alert["priority"] == "MEDIUM" else "#radarLowStyle"
         elif "PIDS" in clean_type: style = "#pidsAlertStyle"
         else: style = "#cameraHighStyle" if alert["priority"] == "HIGH" else "#cameraMediumStyle" if alert["priority"] == "MEDIUM" else "#cameraLowStyle"
-        lat_val = alert.get("latitude", alert.get("loc", [0,0])[0])
-        lng_val = alert.get("longitude", alert.get("loc", [0,0])[1])
-        kml += f'<Placemark><name>{alert["sensor_name"]}_{alert["alert_id"]}</name><description>Priority: {alert["priority"]}\nDistance: {alert.get("distance_m", 0)}m\nTimestamp: {alert["timestamp"]}</description><styleUrl>{style}</styleUrl><Point><coordinates>{lng_val},{lat_val},0</coordinates></Point></Placemark>'
+        kml += f'<Placemark><name>{alert["sensor_name"]}_{alert["alert_id"]}</name><description>Priority: {alert["priority"]}\nDistance: {alert.get("distance_m", 0)}m\nTimestamp: {alert["timestamp"]}</description><styleUrl>{style}</styleUrl><Point><coordinates>{alert.get("longitude",0)},{alert.get("latitude",0)},0</coordinates></Point></Placemark>'
     
     kml += "\n</Document>\n</kml>"
     return {"csv_content": csv_io.getvalue(), "kml_content": kml}
 
-@app.post("/api/export")
-async def generate_exports(payload: ExportRequest, request: Request):
-    dev_list = [{"id": d.id, "type": d.type, "lat": d.lat, "lng": d.lng, "innerRange": d.innerRange, "outerRange": d.outerRange, "azimuth": d.azimuth, "fov": d.fov, "isPolygon": d.isPolygon, "polygon": d.polygon, "color": d.color} for d in payload.devices]
-    return compile_kml_and_csv(f"{payload.scenarioName} Report", payload.alerts, dev_list)
-
-@app.post("/api/export/range")
-def generate_range_exports(payload: RangeExportRequest, db: Session = Depends(get_db)):
-    alerts_query = db.query(AlertLog).filter(AlertLog.timestamp >= payload.startTime, AlertLog.timestamp <= payload.endTime).all()
-    alerts_list = [{
-        "sensor_type": a.sensor_type, "sensor_name": a.sensor_name, "alert_id": a.alert_id,
-        "priority": a.priority, "latitude": a.latitude, "longitude": a.longitude,
-        "distance_m": a.distance_m, "bearing": a.bearing, "timestamp": a.timestamp
-    } for a in alerts_query]
-
-    devs_query = db.query(DeviceConfigDB).all()
-    devs_list = [{"id": d.id, "type": d.type, "lat": d.lat, "lng": d.lng, "innerRange": d.innerRange, "outerRange": d.outerRange, "azimuth": d.azimuth, "fov": d.fov, "isPolygon": d.isPolygon, "polygon": json.loads(d.polygon) if d.polygon else []} for d in devs_query]
-    return compile_kml_and_csv(payload.reportName or "Time_Range_Report", alerts_list, devs_list)
-
+# [FIX 3] Strip alerts from /runs API so frontend never downloads ~200MB DB into RAM on page load
 @app.get("/api/runs")
 def get_all_runs(db: Session = Depends(get_db)):
     runs = db.query(SimulationRun).order_by(SimulationRun.id.desc()).all()
-    result = []
-    for r in runs:
-        alerts = [{
-            "sensor_type": a.sensor_type, "sensor_name": a.sensor_name, "alert_id": a.alert_id,
-            "priority": a.priority, "latitude": a.latitude, "longitude": a.longitude,
-            "distance_m": a.distance_m, "bearing": a.bearing, "timestamp": a.timestamp
-        } for a in r.alerts]
-        result.append({
-            "id": r.id, "scenarioName": r.scenario_name, "alertsGenerated": r.total_alerts,
-            "timestamp": r.timestamp, "devices": json.loads(r.devices_snapshot) if r.devices_snapshot else [],
-            "alerts": alerts
-        })
-    return result
+    return [{
+        "id": r.id, "scenarioName": r.scenario_name, "alertsGenerated": r.total_alerts,
+        "timestamp": r.timestamp, "devices": json.loads(r.devices_snapshot) if r.devices_snapshot else []
+    } for r in runs]
+
+# New precise endpoint that creates report dynamically without pushing DB into browser memory
+@app.get("/api/export/run/{run_id}")
+def export_specific_run(run_id: int, db: Session = Depends(get_db)):
+    run = db.query(SimulationRun).filter(SimulationRun.id == run_id).first()
+    result = db.execute(text("SELECT sensor_type, sensor_name, alert_id, priority, latitude, longitude, distance_m, bearing, timestamp FROM alert_logs WHERE run_id = :rid"), {"rid": run_id})
+    alerts_list = [dict(row._mapping) for row in result]
+    devs_list = json.loads(run.devices_snapshot) if run.devices_snapshot else []
+    return compile_kml_and_csv(f"{run.scenario_name} Report", alerts_list, devs_list)
+
+@app.post("/api/export/range")
+def generate_range_exports(payload: RangeExportRequest, db: Session = Depends(get_db)):
+    result = db.execute(text("SELECT sensor_type, sensor_name, alert_id, priority, latitude, longitude, distance_m, bearing, timestamp FROM alert_logs WHERE timestamp >= :st AND timestamp <= :et"), {"st": payload.startTime, "et": payload.endTime})
+    alerts_list = [dict(row._mapping) for row in result]
+    devs_query = db.query(DeviceConfigDB).all()
+    devs_list = [{"id": d.id, "type": d.type, "lat": d.lat, "lng": d.lng, "innerRange": d.innerRange, "outerRange": d.outerRange, "azimuth": d.azimuth, "fov": d.fov, "isPolygon": d.isPolygon, "polygon": json.loads(d.polygon) if d.polygon else [], "envCategory": getattr(d, 'envCategory', 'GENERAL'), "color": getattr(d, 'color', '#3b82f6'), "sourceFile": getattr(d, 'sourceFile', 'Uploaded KML')} for d in devs_query]
+    return compile_kml_and_csv(payload.reportName or "Time_Range_Report", alerts_list, devs_list)
 
 @app.get("/api/config/devices")
 def get_saved_devices(db: Session = Depends(get_db)):
     devices = db.query(DeviceConfigDB).all()
-    return [{"id": d.id, "type": d.type, "lat": d.lat, "lng": d.lng, "innerRange": d.innerRange, "outerRange": d.outerRange, "azimuth": d.azimuth, "fov": d.fov, "alertCount": d.alertCount, "packetChoice": d.packetChoice, "isPolygon": d.isPolygon, "polygon": json.loads(d.polygon) if d.polygon else []} for d in devices]
+    return [{"id": d.id, "type": d.type, "lat": d.lat, "lng": d.lng, "innerRange": d.innerRange, "outerRange": d.outerRange, "azimuth": d.azimuth, "fov": d.fov, "alertCount": d.alertCount, "packetChoice": d.packetChoice, "isPolygon": d.isPolygon, "polygon": json.loads(d.polygon) if d.polygon else [], "envCategory": getattr(d, 'envCategory', 'GENERAL'), "color": getattr(d, 'color', '#3b82f6'), "sourceFile": getattr(d, 'sourceFile', 'Uploaded KML')} for d in devices]
 
 @app.post("/api/config/devices")
 def save_devices(payload: List[DeviceModel], db: Session = Depends(get_db)):
@@ -522,9 +494,16 @@ def save_devices(payload: List[DeviceModel], db: Session = Depends(get_db)):
             db_dev = db.query(DeviceConfigDB).filter(DeviceConfigDB.id == dev.id).first()
             poly_str = json.dumps(dev.polygon) if dev.polygon else "[]"
             if db_dev:
-                db_dev.type = str(dev.type); db_dev.lat = float(dev.lat); db_dev.lng = float(dev.lng); db_dev.innerRange = float(dev.innerRange); db_dev.outerRange = float(dev.outerRange); db_dev.azimuth = float(dev.azimuth); db_dev.fov = float(dev.fov); db_dev.alertCount = int(dev.alertCount); db_dev.packetChoice = str(dev.packetChoice); db_dev.isPolygon = bool(dev.isPolygon); db_dev.polygon = poly_str
+                db_dev.type = str(dev.type); db_dev.lat = float(dev.lat); db_dev.lng = float(dev.lng)
+                db_dev.innerRange = float(dev.innerRange); db_dev.outerRange = float(dev.outerRange)
+                db_dev.azimuth = float(dev.azimuth); db_dev.fov = float(dev.fov)
+                db_dev.alertCount = int(dev.alertCount); db_dev.packetChoice = str(dev.packetChoice)
+                db_dev.isPolygon = bool(dev.isPolygon); db_dev.polygon = poly_str
+                db_dev.envCategory = str(dev.envCategory or "GENERAL")
+                db_dev.color = str(dev.color or "#3b82f6")
+                db_dev.sourceFile = str(dev.sourceFile or "Uploaded KML")
             else:
-                new_dev = DeviceConfigDB(id=str(dev.id), type=str(dev.type), lat=float(dev.lat), lng=float(dev.lng), innerRange=float(dev.innerRange), outerRange=float(dev.outerRange), azimuth=float(dev.azimuth), fov=float(dev.fov), alertCount=int(dev.alertCount), packetChoice=str(dev.packetChoice), isPolygon=bool(dev.isPolygon), polygon=poly_str)
+                new_dev = DeviceConfigDB(id=str(dev.id), type=str(dev.type), lat=float(dev.lat), lng=float(dev.lng), innerRange=float(dev.innerRange), outerRange=float(dev.outerRange), azimuth=float(dev.azimuth), fov=float(dev.fov), alertCount=int(dev.alertCount), packetChoice=str(dev.packetChoice), isPolygon=bool(dev.isPolygon), polygon=poly_str, envCategory=str(dev.envCategory or "GENERAL"), color=str(dev.color or "#3b82f6"), sourceFile=str(dev.sourceFile or "Uploaded KML"))
                 db.add(new_dev)
             db.commit()
         except Exception: db.rollback()

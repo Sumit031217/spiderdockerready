@@ -5,19 +5,19 @@ import {
   Globe, Sliders, Play, Square, Terminal, CheckSquare, Download, Target,
   AlertTriangle, Search, ArrowUpDown, Calendar, Layers, FolderTree
 } from 'lucide-react';
-import { MapContainer, TileLayer, Popup, CircleMarker, Circle, Polygon as LeafletPolygon } from 'react-leaflet';
+import { MapContainer, TileLayer, Popup, CircleMarker, Circle, Polygon as LeafletPolygon, Polyline as LeafletPolyline } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 
-// [NEW] Import our new UI and parsing helper components
 import TelemetryProgress from './components/TelemetryProgress';
 import { MultiFileKMLParser } from './utils/kmlparser';
 
 const kmlParser = new MultiFileKMLParser();
 
 // ==========================================
-// GEOMETRY ENGINE
+// GEOMETRY ENGINE 
 // ==========================================
-const getCameraFovPolygon = (lat, lng, radiusMeters, azimuth, fov) => {
+const getCameraFovPolygon = (lat, lng, radiusMeters = 100, azimuth = 0, fov = 360) => {
+  if (lat == null || lng == null || isNaN(lat) || isNaN(lng)) return [];
   const R = 6371000;
   const centerLat = lat * (Math.PI / 180);
   const centerLng = lng * (Math.PI / 180);
@@ -31,7 +31,16 @@ const getCameraFovPolygon = (lat, lng, radiusMeters, azimuth, fov) => {
     const pLng = centerLng + Math.atan2(Math.sin(brng) * Math.sin(radiusMeters / R) * Math.cos(centerLat), Math.cos(radiusMeters / R) - Math.sin(centerLat) * Math.sin(pLat));
     points.push([pLat * (180 / Math.PI), pLng * (180 / Math.PI)]);
   }
-  return points;
+  return points.length > 0 ? points : [];
+};
+
+const parseKmlColor = (kmlHex) => {
+  if (!kmlHex || String(kmlHex).length !== 8) return null;
+  const hexStr = String(kmlHex);
+  const rr = hexStr.substring(6, 8);
+  const gg = hexStr.substring(4, 6);
+  const bb = hexStr.substring(2, 4);
+  return `#${rr}${gg}${bb}`;
 };
 
 // ==========================================
@@ -40,14 +49,15 @@ const getCameraFovPolygon = (lat, lng, radiusMeters, azimuth, fov) => {
 const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas }) => {
   const [status, setStatus] = useState({ message: 'System Ready', type: 'info' });
 
-  const hardwareSensors = devices.filter(d => !d.type.toUpperCase().includes('ENV'));
-  const environmentFeatures = devices.filter(d => d.type.toUpperCase().includes('ENV'));
+  const safeDevices = Array.isArray(devices) ? devices : [];
+  const hardwareSensors = safeDevices.filter(d => d && d.type && !String(d.type).toUpperCase().includes('ENV'));
+  const environmentFeatures = safeDevices.filter(d => d && d.type && String(d.type).toUpperCase().includes('ENV'));
 
   const syncDevicesToDB = async () => {
     try {
       const response = await fetch('http://127.0.0.1:8000/api/config/devices', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(devices)
+        body: JSON.stringify(safeDevices)
       });
       if (response.ok) {
         alert("✅ SUCCESS: All Sensors & GIS features saved to PostgreSQL!");
@@ -65,7 +75,7 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
     try {
       const response = await fetch('http://127.0.0.1:8000/api/config/schemas', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(sensorSchemas)
+        body: JSON.stringify(Array.isArray(sensorSchemas) ? sensorSchemas : [])
       });
       if (response.ok) {
         alert("✅ SUCCESS: Packet Formats saved to PostgreSQL!");
@@ -126,7 +136,7 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
             combinedSensors = [...combinedSensors, ...parsedSensors];
         } catch (err) { alert(`🚨 FORMAT ERROR in ${file.name}!\n\nDetails: ${err.message}`); }
     }
-    setDevices(prev => [...prev, ...combinedSensors]);
+    setDevices(prev => [...(Array.isArray(prev) ? prev : []), ...combinedSensors]);
     setStatus({ message: `Loaded ${combinedSensors.length} Sensors. Please click 'Save Sensors to DB'.`, type: 'info' });
   };
 
@@ -152,11 +162,10 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
             combinedSchemas = [...combinedSchemas, ...schemasToAdd];
         } catch (err) { alert(`🚨 SCHEMA ERROR in ${file.name}!\n\nDetails: ${err.message}`); }
     }
-    setSensorSchemas(prev => [...prev, ...combinedSchemas]);
+    setSensorSchemas(prev => [...(Array.isArray(prev) ? prev : []), ...combinedSchemas]);
     setStatus({ message: `Loaded ${combinedSchemas.length} Protocol Schemas. Please click 'Save Formats to DB'.`, type: 'info' });
   };
 
-  // [INTEGRATION] Use MultiFileKMLParser to prevent style collisions and memory bloat
   const handleEnvironmentKmlUpload = async (event) => {
     const files = Array.from(event.target.files);
     if (!files.length) return;
@@ -180,7 +189,8 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
             isolatedLayer.features.forEach((feat) => {
                 combinedEnvs.push({
                     id: feat.name, type: "Environment", envCategory, sourceFile: file.name,
-                    isPolygon: feat.geometryType === 'Polygon', polygon: feat.coordinates,
+                    isPolygon: feat.geometryType === 'Polygon' || feat.geometryType === 'LineString', 
+                    polygon: feat.coordinates,
                     lat: feat.coordinates[0]?.[0] || 0, lng: feat.coordinates[0]?.[1] || 0,
                     innerRange: 0, outerRange: 0, azimuth: 0, fov: 0, alertCount: 0, packetChoice: "",
                     color: feat.style.fillColor
@@ -188,19 +198,19 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
             });
         } catch (err) { alert(`🚨 KML SYNTAX ERROR in ${file.name}!`); }
     }
-    setDevices(prev => [...prev, ...combinedEnvs]);
+    setDevices(prev => [...(Array.isArray(prev) ? prev : []), ...combinedEnvs]);
     setStatus({ message: `Loaded ${combinedEnvs.length} GIS Features via MultiFileKMLParser. Click 'Save GIS to DB'.`, type: 'info' });
   };
 
   const removeDevice = (id) => {
-    setDevices(devices.filter(d => d.id !== id));
-    fetch(`http://127.0.0.1:8000/api/config/devices/${id}`, { method: 'DELETE' }).catch(console.error);
+    setDevices(safeDevices.filter(d => d.id !== id));
+    fetch(`http://127.0.0.1:8000/api/config/devices/${id}`, { method: 'DELETE' }).catch(() => {});
   };
 
   const clearAllEnvironmentFeatures = async () => {
     if (!window.confirm(`Are you sure you want to remove all ${environmentFeatures.length} loaded GIS layers? Your hardware sensors will remain intact.`)) return;
     const envIds = environmentFeatures.map(f => f.id);
-    setDevices(prev => prev.filter(d => !d.type.toUpperCase().includes('ENV')));
+    setDevices(prev => (Array.isArray(prev) ? prev : []).filter(d => d.type && !String(d.type).toUpperCase().includes('ENV')));
     for (const id of envIds) {
       fetch(`http://127.0.0.1:8000/api/config/devices/${id}`, { method: 'DELETE' }).catch(() => {});
     }
@@ -208,8 +218,8 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
   };
 
   const removeSchema = (name) => {
-    setSensorSchemas(sensorSchemas.filter(s => s.name !== name));
-    fetch(`http://127.0.0.1:8000/api/config/schemas/${name}`, { method: 'DELETE' }).catch(console.error);
+    setSensorSchemas((Array.isArray(sensorSchemas) ? sensorSchemas : []).filter(s => s.name !== name));
+    fetch(`http://127.0.0.1:8000/api/config/schemas/${name}`, { method: 'DELETE' }).catch(() => {});
   };
 
   return (
@@ -255,19 +265,19 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
                 <thead className="bg-slate-950/50 text-slate-400 font-mono text-xs sticky top-0 z-10"><tr><th className="p-3">ID / Protocol</th><th className="p-3">Location / Boundary</th><th className="p-3">Parameters</th><th className="p-3 text-right">Action</th></tr></thead>
                 <tbody className="divide-y divide-slate-800/50">
                   {hardwareSensors.map((dev, idx) => {
-                    const hasPacketChoice = !!dev.packetChoice;
-                    const isMissingPacket = hasPacketChoice && !sensorSchemas.some(s => s.name.toUpperCase() === dev.packetChoice.toUpperCase());
+                    const devName = dev?.packetChoice || '';
+                    const isMissingPacket = devName && !(Array.isArray(sensorSchemas) ? sensorSchemas : []).some(s => s && s.name && s.name.toUpperCase() === devName.toUpperCase());
                     return (
-                      <tr key={idx} className="hover:bg-slate-800/30">
+                      <tr key={dev.id || idx} className="hover:bg-slate-800/30">
                         <td className="p-3">
-                            <div className="font-bold text-slate-200">{dev.id}</div>
+                            <div className="font-bold text-slate-200">{dev.id || "Unknown"}</div>
                             <div className={`text-xs uppercase flex items-center ${isMissingPacket ? 'text-rose-400 font-bold' : 'text-cyan-500'}`}>
-                                {dev.packetChoice ? `PKT: ${dev.packetChoice}` : dev.type}
+                                {dev.packetChoice ? `PKT: ${dev.packetChoice}` : (dev.type || 'UNKNOWN')}
                                 {isMissingPacket && <AlertTriangle className="w-3 h-3 ml-1" />}
                             </div>
                         </td>
-                        <td className="p-3 font-mono text-xs text-slate-400">{dev.isPolygon ? `PIDS FENCE (${dev.polygon?.length || 0} pts)` : `${dev.lat.toFixed(4)}, ${dev.lng.toFixed(4)}`}</td>
-                        <td className="p-3 font-mono text-cyan-400 text-xs">{dev.isPolygon ? `${dev.alertCount} Target Alerts` : `${dev.innerRange}-${dev.outerRange}m | ${dev.alertCount} Alerts`}</td>
+                        <td className="p-3 font-mono text-xs text-slate-400">{dev.isPolygon ? `PIDS FENCE (${Array.isArray(dev.polygon) ? dev.polygon.length : 0} pts)` : `${parseFloat(dev.lat || 0).toFixed(4)}, ${parseFloat(dev.lng || 0).toFixed(4)}`}</td>
+                        <td className="p-3 font-mono text-cyan-400 text-xs">{dev.isPolygon ? `${dev.alertCount || 0} Target Alerts` : `${dev.innerRange || 0}-${dev.outerRange || 0}m | ${dev.alertCount || 0} Alerts`}</td>
                         <td className="p-3 text-right"><button onClick={() => removeDevice(dev.id)} className="text-slate-500 hover:text-rose-400"><Trash2 className="w-4 h-4 inline" /></button></td>
                       </tr>
                     );
@@ -280,17 +290,17 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
 
         <div className="bg-slate-900 border border-slate-800 rounded-lg flex flex-col overflow-hidden shadow-sm h-[380px]">
           <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex justify-between items-center">
-            <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center"><Settings className="w-4 h-4 mr-2 text-fuchsia-400"/> Packet Formats ({sensorSchemas.length})</h3>
+            <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center"><Settings className="w-4 h-4 mr-2 text-fuchsia-400"/> Packet Formats ({(Array.isArray(sensorSchemas) ? sensorSchemas : []).length})</h3>
             <button onClick={syncSchemasToDB} className="bg-fuchsia-600 hover:bg-fuchsia-500 text-white font-bold py-1.5 px-4 rounded text-xs flex items-center shadow-lg"><Save className="w-4 h-4 mr-2" /> SAVE FORMATS</button>
           </div>
           <div className="flex-1 overflow-auto">
-            {sensorSchemas.length === 0 ? <div className="p-10 text-center text-slate-500 font-mono text-xs">No schemas loaded.</div> : (
+            {(!sensorSchemas || sensorSchemas.length === 0) ? <div className="p-10 text-center text-slate-500 font-mono text-xs">No schemas loaded.</div> : (
               <table className="w-full text-left text-xs whitespace-nowrap">
                 <thead className="bg-slate-950/50 text-slate-400 font-mono sticky top-0"><tr><th className="p-3">Protocol Match</th><th className="p-3 text-right">Action</th></tr></thead>
                 <tbody className="divide-y divide-slate-800/50">
                   {sensorSchemas.map((schema, idx) => (
-                    <tr key={idx} className="hover:bg-slate-800/30">
-                      <td className="p-3 font-bold text-fuchsia-400">{schema.name} <span className="text-slate-500 font-normal">[{schema.separator}]</span></td>
+                    <tr key={schema.name || idx} className="hover:bg-slate-800/30">
+                      <td className="p-3 font-bold text-fuchsia-400">{schema.name || 'UNKNOWN'} <span className="text-slate-500 font-normal">[{schema.separator || ','}]</span></td>
                       <td className="p-3 text-right"><button onClick={() => removeSchema(schema.name)} className="text-slate-500 hover:text-rose-400"><Trash2 className="w-4 h-4 inline" /></button></td>
                     </tr>
                   ))}
@@ -327,22 +337,26 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
               <thead className="bg-slate-950/50 text-slate-400 font-mono text-xs sticky top-0 z-10">
                 <tr>
                   <th className="p-3">Source File / Feature</th>
-                  <th className="p-3">Category</th>
+                  <th className="p-3">Geometry</th>
                   <th className="p-3">Coordinates / Vertices</th>
                   <th className="p-3">Assigned Layer Color</th>
                   <th className="p-3 text-right">Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/50">
-                {environmentFeatures.map((env, idx) => (
-                  <tr key={idx} className="hover:bg-slate-800/30">
+                {environmentFeatures.map((env, idx) => {
+                  const isLine = ['ROAD', 'RAILWAY'].includes(env.envCategory);
+                  return (
+                  <tr key={env.id || idx} className="hover:bg-slate-800/30">
                     <td className="p-3">
-                      <div className="font-bold text-emerald-400">{env.id}</div>
+                      <div className="font-bold text-emerald-400">{env.id || 'Unknown'}</div>
                       <div className="text-[11px] font-mono text-slate-500">{env.sourceFile || 'Uploaded KML'}</div>
                     </td>
-                    <td className="p-3 font-mono text-xs text-slate-300 uppercase">{env.envCategory}</td>
+                    <td className="p-3 font-mono text-xs text-slate-300 uppercase">
+                      {env.isPolygon ? (isLine ? "POLYLINE" : "POLYGON") : "POINT"}
+                    </td>
                     <td className="p-3 font-mono text-xs text-slate-400">
-                      {env.isPolygon ? `${env.polygon?.length || 0} Vertices` : `${env.lat.toFixed(4)}, ${env.lng.toFixed(4)}`}
+                      {env.isPolygon ? `${env.polygon?.length || 0} Vertices` : `${parseFloat(env.lat || 0).toFixed(4)}, ${parseFloat(env.lng || 0).toFixed(4)}`}
                     </td>
                     <td className="p-3 font-mono text-xs flex items-center space-x-2">
                       <span className="w-3.5 h-3.5 rounded-full border border-slate-500 shadow-sm inline-block" style={{ backgroundColor: env.color || '#3b82f6' }}></span>
@@ -354,7 +368,7 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
                       </button>
                     </td>
                   </tr>
-                ))}
+                )})}
               </tbody>
             </table>
           )}
@@ -369,19 +383,26 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
 // ==========================================
 const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas }) => {
   const [status, setStatus] = useState('');
-  const configurableSensors = devices.filter(d => {
-      if (d.type.toUpperCase().includes('ENV')) return false;
-      const isMissingPacket = d.packetChoice && !sensorSchemas.some(s => s.name.toUpperCase() === d.packetChoice.toUpperCase());
+  
+  const safeDevices = Array.isArray(devices) ? devices : [];
+  const safeSchemas = Array.isArray(sensorSchemas) ? sensorSchemas : [];
+  const safeActiveDevices = Array.isArray(scenario?.activeDevices) ? scenario.activeDevices : [];
+
+  const configurableSensors = safeDevices.filter(d => {
+      if (!d || !d.type || String(d.type).toUpperCase().includes('ENV')) return false;
+      const hasPacketChoice = !!d.packetChoice;
+      const isMissingPacket = hasPacketChoice && !safeSchemas.some(s => s && s.name && String(s.name).toUpperCase() === String(d.packetChoice).toUpperCase());
       return !isMissingPacket; 
   });
 
-  const allSensorIds = configurableSensors.map(d => d.id);
-  const isAllSelected = allSensorIds.length > 0 && allSensorIds.every(id => scenario.activeDevices.includes(id));
+  const allSensorIds = configurableSensors.map(d => d.id).filter(Boolean);
+  const isAllSelected = allSensorIds.length > 0 && allSensorIds.every(id => safeActiveDevices.includes(id));
+  
   const handleSelectAll = () => {
     if (isAllSelected) {
-        setScenario(prev => ({ ...prev, activeDevices: prev.activeDevices.filter(id => !allSensorIds.includes(id)) }));
+        setScenario(prev => ({ ...prev, activeDevices: (prev.activeDevices || []).filter(id => !allSensorIds.includes(id)) }));
     } else {
-        setScenario(prev => ({ ...prev, activeDevices: [...new Set([...prev.activeDevices, ...allSensorIds])] }));
+        setScenario(prev => ({ ...prev, activeDevices: [...new Set([...(prev.activeDevices || []), ...allSensorIds])] }));
     }
   };
 
@@ -389,16 +410,18 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas }) 
     const { name, value, type, checked } = e.target;
     setScenario(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
   };
+  
   const toggleDevice = (id) => {
     setScenario(prev => {
-      const isActive = prev.activeDevices.includes(id);
-      return { ...prev, activeDevices: isActive ? prev.activeDevices.filter(d => d !== id) : [...prev.activeDevices, id] };
+      const activeList = Array.isArray(prev.activeDevices) ? prev.activeDevices : [];
+      const isActive = activeList.includes(id);
+      return { ...prev, activeDevices: isActive ? activeList.filter(d => d !== id) : [...activeList, id] };
     });
   };
 
   const handleSave = async (e) => {
     e.preventDefault();
-    if(scenario.activeDevices.length === 0) return alert("You must select at least one active sensor!");
+    if(!scenario || !Array.isArray(scenario.activeDevices) || scenario.activeDevices.length === 0) return alert("You must select at least one active sensor!");
     try {
         const response = await fetch('http://127.0.0.1:8000/api/state/scenario', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(scenario) });
         if (response.ok) {
@@ -418,7 +441,7 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas }) 
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm md:col-span-2">
           <div>
             <label className="block text-xs font-mono text-slate-500 mb-1 uppercase tracking-wider">Mission Designation (Scenario Name)</label>
-            <input type="text" name="name" required value={scenario.name} onChange={handleChange} className="w-full bg-slate-950 border border-slate-800 rounded px-4 py-3 text-white text-lg font-bold focus:border-indigo-500 focus:outline-none" />
+            <input type="text" name="name" required value={scenario?.name || ''} onChange={handleChange} className="w-full bg-slate-950 border border-slate-800 rounded px-4 py-3 text-white text-lg font-bold focus:border-indigo-500 focus:outline-none" />
           </div>
         </div>
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm">
@@ -436,20 +459,22 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas }) 
 
           <div className="space-y-2 max-h-48 overflow-y-auto pr-2">
             {configurableSensors.length === 0 ? <div className="text-xs font-mono text-rose-400 p-3 bg-rose-950/20 border border-rose-900/50 rounded">No valid sensors loaded. Check missing formats.</div> : (
-              configurableSensors.map(dev => (
-                <div key={dev.id} onClick={() => toggleDevice(dev.id)} className={`flex items-center justify-between p-3 rounded cursor-pointer border transition-colors ${scenario.activeDevices.includes(dev.id) ? 'bg-indigo-950/40 border-indigo-500/50' : 'bg-slate-950 border-slate-800 hover:border-slate-700'}`}>
-                  <div><span className={`text-sm font-bold ${scenario.activeDevices.includes(dev.id) ? 'text-indigo-400' : 'text-slate-300'}`}>{dev.id}</span><span className="text-xs text-slate-500 ml-2 uppercase">({dev.type})</span></div>
-                  <input type="checkbox" checked={scenario.activeDevices.includes(dev.id)} readOnly className="w-4 h-4 accent-indigo-500" />
+              configurableSensors.map(dev => {
+                const isActive = (scenario?.activeDevices || []).includes(dev.id);
+                return (
+                <div key={dev.id} onClick={() => toggleDevice(dev.id)} className={`flex items-center justify-between p-3 rounded cursor-pointer border transition-colors ${isActive ? 'bg-indigo-950/40 border-indigo-500/50' : 'bg-slate-950 border-slate-800 hover:border-slate-700'}`}>
+                  <div><span className={`text-sm font-bold ${isActive ? 'text-indigo-400' : 'text-slate-300'}`}>{dev.id}</span><span className="text-xs text-slate-500 ml-2 uppercase">({dev.type})</span></div>
+                  <input type="checkbox" checked={isActive} readOnly className="w-4 h-4 accent-indigo-500" />
                 </div>
-              ))
+              )})
             )}
           </div>
         </div>
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm">
           <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-4 flex items-center border-b border-slate-800 pb-2"><Network className="w-4 h-4 mr-2 text-cyan-400"/> Target Routing</h3>
           <div className="grid grid-cols-1 gap-4">
-            <div><label className="block text-xs font-mono text-slate-500 mb-1">Target UDP IP Address</label><input type="text" name="udpIp" value={scenario.udpIp} onChange={handleChange} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-cyan-400 font-mono" /></div>
-            <div><label className="block text-xs font-mono text-slate-500 mb-1">Target UDP Port</label><input type="number" name="udpPort" value={scenario.udpPort} onChange={handleChange} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-cyan-400 font-mono" /></div>
+            <div><label className="block text-xs font-mono text-slate-500 mb-1">Target UDP IP Address</label><input type="text" name="udpIp" value={scenario?.udpIp || ''} onChange={handleChange} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-cyan-400 font-mono" /></div>
+            <div><label className="block text-xs font-mono text-slate-500 mb-1">Target UDP Port</label><input type="number" name="udpPort" value={scenario?.udpPort || 5005} onChange={handleChange} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-cyan-400 font-mono" /></div>
           </div>
         </div>
         <div className="md:col-span-2 flex justify-end"><button type="submit" className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-8 py-3 rounded text-sm shadow-lg"><Save className="w-4 h-4 inline mr-2" />SAVE SCENARIO ARCHITECTURE</button></div>
@@ -466,7 +491,8 @@ const AlertGeneratorView = ({
     simIsRunning, simLogs, simProgress, startSimulation, stopSimulation, 
     overrideCounts, setOverrideCounts, getAlertCount 
 }) => {
-  const activeFleet = devices.filter(d => scenario.activeDevices.includes(d.id));
+  const safeDevices = Array.isArray(devices) ? devices : [];
+  const activeFleet = safeDevices.filter(d => d && (scenario?.activeDevices || []).includes(d.id));
   const targetTotalAlerts = activeFleet.reduce((acc, dev) => acc + getAlertCount(dev), 0);
 
   const handleChange = (e) => {
@@ -512,13 +538,12 @@ const AlertGeneratorView = ({
               <div>
                 <label className="block text-xs font-mono text-slate-500 mb-1 flex items-center"><Clock className="w-3 h-3 mr-1 text-amber-400"/> Timing Physics (Seconds)</label>
                 <div className="grid grid-cols-2 gap-3">
-                  <input type="number" step="0.0001" name="minDelaySec" value={alertConfig.minDelaySec} onChange={handleChange} disabled={simIsRunning} placeholder="Min" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
-                  <input type="number" step="0.0001" name="maxDelaySec" value={alertConfig.maxDelaySec} onChange={handleChange} disabled={simIsRunning} placeholder="Max" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
+                  <input type="number" step="0.0001" name="minDelaySec" value={alertConfig?.minDelaySec || 0} onChange={handleChange} disabled={simIsRunning} placeholder="Min" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
+                  <input type="number" step="0.0001" name="maxDelaySec" value={alertConfig?.maxDelaySec || 0} onChange={handleChange} disabled={simIsRunning} placeholder="Max" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
                 </div>
               </div>
             </div>
 
-            {/* [INTEGRATION] Use TelemetryProgress to safely render bounded layout */}
             <div className="mb-6">
               <TelemetryProgress packetsSent={simProgress} totalPackets={targetTotalAlerts} />
             </div>
@@ -531,7 +556,7 @@ const AlertGeneratorView = ({
           <div className="bg-[#0A0A0A] border border-slate-800 rounded-lg h-full flex flex-col overflow-hidden shadow-2xl relative">
             <div className="bg-slate-900 border-b border-slate-800 px-5 py-3 flex justify-between items-center z-10"><h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center font-mono"><Terminal className="w-4 h-4 mr-2 text-slate-500"/> Live UDP Telemetry</h3></div>
             <div className="flex-1 overflow-y-auto p-4 font-mono text-[11px] leading-relaxed space-y-1">
-              {simLogs.length === 0 ? <div className="text-slate-600 mt-2">Waiting for simulation to begin...</div> : simLogs.map((log, idx) => (<div key={idx} className={`flex space-x-3 ${log.type === 'error' ? 'text-rose-400' : log.type === 'info' ? 'text-cyan-400' : 'text-emerald-400'}`}><span className="opacity-50 shrink-0">[{log.time}]</span><span className="break-all">{log.msg}</span></div>))}
+              {(!simLogs || simLogs.length === 0) ? <div className="text-slate-600 mt-2">Waiting for simulation to begin...</div> : simLogs.map((log, idx) => (<div key={idx} className={`flex space-x-3 ${log.type === 'error' ? 'text-rose-400' : log.type === 'info' ? 'text-cyan-400' : 'text-emerald-400'}`}><span className="opacity-50 shrink-0">[{log.time}]</span><span className="break-all">{log.msg}</span></div>))}
             </div>
           </div>
         </div>
@@ -541,10 +566,10 @@ const AlertGeneratorView = ({
 };
 
 // ==========================================
-// VIEW 4: TACTICAL MAP WITH LAYER CONTROL PANEL
+// VIEW 4: TACTICAL MAP WITH LAYER CONTROL PANEL 
 // ==========================================
-const MapView = ({ devices, alerts, simIsRunning, simProgress }) => {
-  const mapCenter = devices.length > 0 && devices[0].lat ? [devices[0].lat, devices[0].lng] : [27.2285, 77.4320];
+const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAlertsGenerated }) => {
+  const mapCenter = devices && devices.length > 0 && devices[0].lat ? [devices[0].lat, devices[0].lng] : [27.2285, 77.4320];
   const [showAll, setShowAll] = useState(false);
   const [hiddenLayers, setHiddenLayers] = useState({});
 
@@ -556,23 +581,27 @@ const MapView = ({ devices, alerts, simIsRunning, simProgress }) => {
     setHiddenLayers(prev => ({ ...prev, [layerKey]: !prev[layerKey] }));
   };
 
+  const safeDevices = Array.isArray(devices) ? devices : [];
+  const safeAlerts = Array.isArray(alerts) ? alerts : [];
+
   const kmlSources = Array.from(new Set(
-    devices.filter(d => d.type.toUpperCase().includes('ENV')).map(d => d.sourceFile || 'Uploaded KML')
+    safeDevices.filter(d => d && d.type && d.type.toUpperCase().includes('ENV')).map(d => d.sourceFile || 'Uploaded KML')
   ));
 
   const getSourceColor = (srcName) => {
-    const match = devices.find(d => (d.sourceFile || 'Uploaded KML') === srcName);
+    const match = safeDevices.find(d => (d.sourceFile || 'Uploaded KML') === srcName);
     return match ? (match.color || '#3b82f6') : '#3b82f6';
   };
 
-  const visibleDevices = devices.filter(dev => {
+  const visibleDevices = safeDevices.filter(dev => {
+    if (!dev || !dev.type) return false;
     if (dev.type.toUpperCase().includes('ENV')) {
       return !hiddenLayers[dev.sourceFile || 'Uploaded KML'];
     }
     return !hiddenLayers['HARDWARE_SENSORS'];
   });
 
-  const displayedAlerts = (showAll ? alerts : alerts.slice(-1000)).filter(() => !hiddenLayers['LIVE_ALERTS']);
+  const displayedAlerts = (showAll ? safeAlerts : safeAlerts.slice(-1000)).filter(() => !hiddenLayers['LIVE_ALERTS']);
 
   return (
     <div className="p-6 space-y-6 max-w-[1600px] mx-auto h-[calc(100vh-4rem)] flex flex-col font-sans relative">
@@ -586,7 +615,8 @@ const MapView = ({ devices, alerts, simIsRunning, simProgress }) => {
         <div className="flex space-x-3">
             <div className="flex items-center space-x-2 bg-rose-950/40 border border-rose-900 rounded px-3 py-1">
                 <Target className="w-4 h-4 text-rose-500" />
-                <span className="text-xs font-mono text-rose-400 font-bold">TOTAL GENERATED: {simIsRunning ? simProgress : (alerts ? alerts.length : 0)}</span>
+                {/* [FIX 3] Real uncapped total metric derived from DB/Progress, not the sliced map array */}
+                <span className="text-xs font-mono text-rose-400 font-bold">TOTAL GENERATED: {totalAlertsGenerated}</span>
             </div>
         </div>
       </div>
@@ -634,13 +664,13 @@ const MapView = ({ devices, alerts, simIsRunning, simProgress }) => {
           </div>
         </div>
 
-        {alerts && alerts.length > 1000 && !simIsRunning && (
+        {safeAlerts.length > 1000 && !simIsRunning && (
             <div className="absolute top-4 right-4 z-[1000]">
                 <button 
                     onClick={() => setShowAll(!showAll)}
                     className={`font-bold py-2 px-4 rounded shadow-lg text-xs flex items-center transition-colors ${showAll ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-rose-600 hover:bg-rose-500 text-white'}`}
                 >
-                    {showAll ? 'SHOW LATEST 1000 ONLY' : `LOAD ALL ${alerts.length} ALERTS (MAY LAG)`}
+                    {showAll ? 'SHOW LATEST 1000 ONLY' : `LOAD ALL ${safeAlerts.length} ALERTS (MAY LAG)`}
                 </button>
             </div>
         )}
@@ -649,53 +679,70 @@ const MapView = ({ devices, alerts, simIsRunning, simProgress }) => {
           <TileLayer attribution='&copy; CartoDB' url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png" />
           
           {visibleDevices.map((dev) => {
+            if (!dev || !dev.type) return null;
             const isEnv = dev.type.toUpperCase().includes('ENV');
             const isCam = dev.type.toUpperCase().includes('CAM');
             const isRadar = dev.type.toUpperCase().includes('RADAR');
             const layerColor = dev.color || "#3b82f6";
+            const safePoly = Array.isArray(dev.polygon) ? dev.polygon : [];
+            const isLine = ['ROAD', 'RAILWAY'].includes(dev.envCategory);
             
             return (
-              <React.Fragment key={dev.id}>
-                {isEnv && dev.isPolygon && dev.polygon && (
-                  <LeafletPolygon 
-                    positions={dev.polygon} 
-                    pathOptions={{ 
-                      color: layerColor, 
-                      fillColor: layerColor, 
-                      fillOpacity: dev.envCategory === 'ROAD' ? 0.0 : dev.envCategory === 'BUILDING' ? 0.55 : 0.35, 
-                      weight: dev.envCategory === 'ROAD' ? 2.5 : dev.envCategory === 'PERIMETER' ? 3.5 : 1.5 
-                    }}
-                  >
-                    <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
-                  </LeafletPolygon>
+              <React.Fragment key={dev.id || Math.random()}>
+                {isEnv && dev.isPolygon && safePoly.length > 0 && (
+                  isLine ? (
+                    <LeafletPolyline 
+                      positions={safePoly} 
+                      pathOptions={{ color: layerColor, weight: 2.5 }}
+                    >
+                      <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
+                    </LeafletPolyline>
+                  ) : (
+                    <LeafletPolygon 
+                      positions={safePoly} 
+                      pathOptions={{ 
+                        color: layerColor, 
+                        fillColor: layerColor, 
+                        fillOpacity: dev.envCategory === 'BUILDING' ? 0.55 : 0.35, 
+                        weight: dev.envCategory === 'PERIMETER' ? 3.5 : 1.5 
+                      }}
+                    >
+                      <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
+                    </LeafletPolygon>
+                  )
                 )}
-                {isEnv && !dev.isPolygon && (
+                
+                {isEnv && !dev.isPolygon && dev.lat != null && dev.lng != null && (
                   <CircleMarker center={[dev.lat, dev.lng]} radius={4} pathOptions={{ color: '#ffffff', fillColor: layerColor, fillOpacity: 1, weight: 1.5 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup></CircleMarker>
                 )}
 
-                {dev.isPolygon && dev.polygon && !isEnv && (
-                  <LeafletPolygon positions={dev.polygon} pathOptions={{ color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.3, weight: 3 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>PIDS Perimeter Array</Popup></LeafletPolygon>
+                {dev.isPolygon && safePoly.length > 0 && !isEnv && (
+                  <LeafletPolygon positions={safePoly} pathOptions={{ color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.3, weight: 3 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>PIDS Perimeter Array</Popup></LeafletPolygon>
                 )}
 
-                {!dev.isPolygon && isCam && (
+                {!dev.isPolygon && isCam && dev.lat != null && dev.lng != null && (
                   <LeafletPolygon positions={getCameraFovPolygon(dev.lat, dev.lng, dev.outerRange, dev.azimuth, dev.fov)} pathOptions={{ color: '#eab308', fillColor: '#eab308', fillOpacity: 0.25, weight: 1.5 }} />
                 )}
 
-                {!dev.isPolygon && isRadar && (
-                  <><Circle center={[dev.lat, dev.lng]} radius={dev.outerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.1, weight: 1.5, dashArray: "5, 5" }} /><Circle center={[dev.lat, dev.lng]} radius={dev.innerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.0, weight: 2 }} /></>
+                {!dev.isPolygon && isRadar && dev.lat != null && dev.lng != null && (
+                  <><Circle center={[dev.lat, dev.lng]} radius={dev.outerRange || 100} pathOptions={{ color: '#ef4444', fillOpacity: 0.1, weight: 1.5, dashArray: "5, 5" }} /><Circle center={[dev.lat, dev.lng]} radius={dev.innerRange || 0} pathOptions={{ color: '#ef4444', fillOpacity: 0.0, weight: 2 }} /></>
                 )}
 
-                {!dev.isPolygon && !isEnv && (
+                {!dev.isPolygon && !isEnv && dev.lat != null && dev.lng != null && (
                   <CircleMarker center={[dev.lat, dev.lng]} radius={5} pathOptions={{ color: '#0f172a', fillColor: isRadar ? '#ef4444' : '#eab308', fillOpacity: 1, weight: 2 }}><Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{dev.id}</strong>Type: {dev.type}</Popup></CircleMarker>
                 )}
               </React.Fragment>
             );
           })}
 
-          {displayedAlerts && displayedAlerts.map((alert, idx) => {
-             const type = alert.sensor_type.toUpperCase();
+          {displayedAlerts.map((alert, idx) => {
+             const lat = alert.latitude ?? (alert.loc ? alert.loc[0] : null);
+             const lng = alert.longitude ?? (alert.loc ? alert.loc[1] : null);
+             if (lat == null || lng == null) return null;
+             
+             const type = String(alert.sensor_type || alert.type || 'UNKNOWN').toUpperCase();
              const pinColor = type.includes('RADAR') ? '#dc2626' : type.includes('CAM') ? '#facc15' : '#22c55e';
-             return (<CircleMarker key={`alert-${alert.alert_id}-${idx}`} center={[alert.latitude, alert.longitude]} radius={5} pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}><Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{alert.sensor_type} ALERT</strong>Track ID: {alert.alert_id}</Popup></CircleMarker>);
+             return (<CircleMarker key={`alert-${alert.alert_id || alert.id || idx}`} center={[lat, lng]} radius={5} pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}><Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{type} ALERT</strong>Track ID: {alert.alert_id || alert.id || 'N/A'}</Popup></CircleMarker>);
           })}
         </MapContainer>
       </div>
@@ -710,41 +757,27 @@ const ExportView = ({ completedRuns }) => {
   const [generatingId, setGeneratingId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [sortConfig, setSortConfig] = useState({ key: 'timestamp', direction: 'desc' });
-  const abortControllerRef = useRef(null);
 
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
   const [rangeReportName, setRangeReportName] = useState('Custom_Time_Range_Report');
   const [isRangeGenerating, setIsRangeGenerating] = useState(false);
 
+  // [FIX 1b] Directly stream memory-efficient DB query on export instead of downloading all alerts
   const handleGenerate = async (run) => {
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
     setGeneratingId(run.id);
-
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/export', { 
-        method: 'POST', 
-        headers: { 'Content-Type': 'application/json' }, 
-        body: JSON.stringify({ scenarioName: run.scenarioName, devices: run.devices, alerts: run.alerts }),
-        signal: controller.signal 
-      });
+      const response = await fetch(`http://127.0.0.1:8000/api/export/run/${run.id}`);
       const data = await response.json();
-      if (data.status === "cancelled") return;
 
       const kmlBlob = new Blob([data.kml_content], { type: 'application/vnd.google-earth.kml+xml' });
       const link1 = document.createElement('a'); link1.href = URL.createObjectURL(kmlBlob); link1.download = `${run.scenarioName}_Output.kml`; link1.click();
       const csvBlob = new Blob([data.csv_content], { type: 'text/csv' });
       const link2 = document.createElement('a'); link2.href = URL.createObjectURL(csvBlob); link2.download = `${run.scenarioName}_Output.csv`; link2.click();
     } catch (err) { 
-      if (err.name === 'AbortError') {
-        alert("🛑 Export Generation Cancelled.");
-      } else {
-        alert("Failed to generate export files from backend.");
-      }
+      alert("Failed to generate export files from backend.");
     } finally {
       setGeneratingId(null);
-      abortControllerRef.current = null;
     }
   };
 
@@ -775,34 +808,29 @@ const ExportView = ({ completedRuns }) => {
     }
   };
 
-  const handleCancel = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-  };
-
   const requestSort = (key) => {
     let direction = 'asc';
     if (sortConfig.key === key && sortConfig.direction === 'asc') { direction = 'desc'; }
     setSortConfig({ key, direction });
   };
 
-  const filteredRuns = completedRuns.filter(run => 
-    run.scenarioName.toLowerCase().includes(searchTerm.toLowerCase())
+  const safeCompletedRuns = Array.isArray(completedRuns) ? completedRuns : [];
+  const filteredRuns = safeCompletedRuns.filter(run => 
+    run && run.scenarioName && String(run.scenarioName).toLowerCase().includes(searchTerm.toLowerCase())
   );
   const sortedRuns = [...filteredRuns].sort((a, b) => {
     let aValue = a[sortConfig.key];
     let bValue = b[sortConfig.key];
 
     if (sortConfig.key === 'timestamp') {
-        aValue = new Date(a.timestamp).getTime() || 0;
-        bValue = new Date(b.timestamp).getTime() || 0;
+        aValue = new Date(a.timestamp || 0).getTime();
+        bValue = new Date(b.timestamp || 0).getTime();
     } else if (sortConfig.key === 'alertsGenerated') {
         aValue = parseInt(a.alertsGenerated, 10) || 0;
         bValue = parseInt(b.alertsGenerated, 10) || 0;
     } else {
-        aValue = (a.scenarioName || '').toLowerCase();
-        bValue = (b.scenarioName || '').toLowerCase();
+        aValue = String(a.scenarioName || '').toLowerCase();
+        bValue = String(b.scenarioName || '').toLowerCase();
     }
 
     if (aValue < bValue) return sortConfig.direction === 'asc' ? -1 : 1;
@@ -890,14 +918,6 @@ const ExportView = ({ completedRuns }) => {
                       <td className="p-4 font-bold text-emerald-400">{run.scenarioName}</td>
                       <td className="p-4 text-slate-300 font-mono">{run.alertsGenerated} Packets</td>
                       <td className="p-4 text-right flex justify-end items-center space-x-2">
-                          {isCurrentGenerating && (
-                            <button 
-                              onClick={handleCancel} 
-                              className="bg-rose-600 hover:bg-rose-500 text-white font-bold px-3 py-2 rounded transition-colors text-xs flex items-center animate-pulse"
-                            >
-                              <Square className="w-3 h-3 mr-1 fill-current" /> CANCEL
-                            </button>
-                          )}
                           <button 
                             onClick={() => handleGenerate(run)} 
                             disabled={isAnyGenerating} 
@@ -957,17 +977,17 @@ export default function App() {
   useEffect(() => {
     fetch('http://127.0.0.1:8000/api/config/schemas')
       .then(res => { if (res.ok) { setDbStatus('CONNECTED'); return res.json(); } throw new Error(); })
-      .then(data => { if(Array.isArray(data)) setSensorSchemas(data); })
+      .then(data => { setSensorSchemas(Array.isArray(data) ? data : []); })
       .catch(e => setDbStatus('DISCONNECTED'));
 
     fetch('http://127.0.0.1:8000/api/config/devices')
-      .then(res => res.json()).then(data => { if(Array.isArray(data)) setDevices(data); }).catch(e => console.error(e));
+      .then(res => res.json()).then(data => { setDevices(Array.isArray(data) ? data : []); }).catch(e => console.error(e));
       
     fetch('http://127.0.0.1:8000/api/state/scenario')
       .then(res => res.json()).then(data => { if(data && data.name) setScenario(data); }).catch(e => console.error(e));
 
     fetch('http://127.0.0.1:8000/api/state/alerts')
-      .then(res => res.json()).then(data => { if(Array.isArray(data)) setActiveAlerts(data); }).catch(e => console.error(e));
+      .then(res => res.json()).then(data => { setActiveAlerts(Array.isArray(data) ? data : []); }).catch(e => console.error(e));
 
     fetchHistory();
   }, []);
@@ -977,23 +997,26 @@ export default function App() {
         fetch('http://127.0.0.1:8000/api/engine/status')
             .then(res => res.json())
             .then(data => {
-                setSimIsRunning(data.is_running);
+                if(!data) return;
+                setSimIsRunning(!!data.is_running);
                 setSimProgress(data.progress || 0); 
                 
-                if (data.logs && data.logs.length > 0) {
+                if (Array.isArray(data.logs) && data.logs.length > 0) {
                     setSimLogs(data.logs);
                 }
-                if (data.is_running || (data.map_alerts && data.map_alerts.length > 0)) {
-                    setActiveAlerts(data.map_alerts || []);
+                
+                // [FIX 2] Properly set rolling alerts instead of endlessly appending
+                if (data.is_running || (Array.isArray(data.map_alerts) && data.map_alerts.length > 0)) {
+                    setActiveAlerts(Array.isArray(data.map_alerts) ? data.map_alerts : []);
                 }
                 
                 if (previousRunningState.current === true && data.is_running === false) {
                     fetchHistory();
                     fetch('http://127.0.0.1:8000/api/state/alerts')
                         .then(r => r.json())
-                        .then(alerts => setActiveAlerts(alerts));
+                        .then(alerts => setActiveAlerts(Array.isArray(alerts) ? alerts : []));
                 }
-                previousRunningState.current = data.is_running;
+                previousRunningState.current = !!data.is_running;
             })
             .catch(() => {});
     }, 500); 
@@ -1002,27 +1025,29 @@ export default function App() {
   }, []);
 
   const startSimulation = async () => {
-    const activeFleet = devices.filter(d => scenario.activeDevices.includes(d.id));
-    const environmentFleet = devices.filter(d => d.type.toUpperCase().includes('ENV'));
+    const safeDevices = Array.isArray(devices) ? devices : [];
+    const activeFleet = safeDevices.filter(d => d && (scenario?.activeDevices || []).includes(d.id));
+    const environmentFleet = safeDevices.filter(d => d && d.type && String(d.type).toUpperCase().includes('ENV'));
     const targetTotalAlerts = activeFleet.reduce((acc, dev) => acc + getAlertCount(dev), 0);
 
     if (activeFleet.length === 0) return alert("MISSION ABORT: No active sensors bound.");
     if (targetTotalAlerts <= 0) return alert("MISSION ABORT: Target payload is 0.");
 
+    // [FIX 2] Wipe old alert states cleanly before new run starts
     setSimIsRunning(true);
     setSimProgress(0);
     setActiveAlerts([]);
-    setSimLogs([{ time: new Date().toLocaleTimeString(), msg: `SYSTEM: Engaging '${scenario.name}'. Requesting transmission...`, type: 'info' }]);
+    setSimLogs([{ time: new Date().toLocaleTimeString(), msg: `SYSTEM: Engaging '${scenario?.name || 'Simulation'}'. Requesting transmission...`, type: 'info' }]);
 
     const activeFleetWithOverrides = activeFleet.map(dev => ({ ...dev, alertCount: getAlertCount(dev) }));
     const payload = {
-        scenarioName: scenario.name,
-        udpIp: scenario.udpIp,
-        udpPort: parseInt(scenario.udpPort, 10) || 5005,
+        scenarioName: scenario?.name || 'Simulation',
+        udpIp: scenario?.udpIp || '127.0.0.1',
+        udpPort: parseInt(scenario?.udpPort, 10) || 5005,
         activeDevices: activeFleetWithOverrides,
         environmentDevices: environmentFleet,
         alertConfig: alertConfig,
-        sensorSchemas: sensorSchemas
+        sensorSchemas: Array.isArray(sensorSchemas) ? sensorSchemas : []
     };
 
     try {
@@ -1046,6 +1071,9 @@ export default function App() {
     { name: 'Alert Generator', icon: BellDot },
     { name: 'Reports / Export', icon: FileOutput },
   ];
+
+  // Dynamic variable to ensure "TOTAL GENERATED" on map tracks the specific DB count accurately
+  const totalAlertsGen = simIsRunning ? simProgress : (completedRuns.length > 0 ? completedRuns[0].alertsGenerated : 0);
 
   return (
     <div className="flex h-screen bg-slate-950 text-slate-100 font-sans selection:bg-cyan-900 overflow-hidden">
@@ -1074,7 +1102,7 @@ export default function App() {
         <div className="flex-1 overflow-y-auto">
           {currentView === 'Device Configuration' && <DeviceConfigView devices={devices} setDevices={setDevices} sensorSchemas={sensorSchemas} setSensorSchemas={setSensorSchemas} />}
           {currentView === 'Scenario Builder' && <ScenarioBuilderView devices={devices} scenario={scenario} setScenario={setScenario} sensorSchemas={sensorSchemas} />}
-          {currentView === 'Tactical Map' && <MapView devices={devices} alerts={activeAlerts} simIsRunning={simIsRunning} simProgress={simProgress} />}
+          {currentView === 'Tactical Map' && <MapView devices={devices} alerts={activeAlerts} simIsRunning={simIsRunning} simProgress={simProgress} totalAlertsGenerated={totalAlertsGen} />}
           {currentView === 'Alert Generator' && <AlertGeneratorView devices={devices} scenario={scenario} alertConfig={alertConfig} setAlertConfig={setAlertConfig} setCompletedRuns={setCompletedRuns} setActiveAlerts={setActiveAlerts} sensorSchemas={sensorSchemas} simIsRunning={simIsRunning} simLogs={simLogs} simProgress={simProgress} startSimulation={startSimulation} stopSimulation={stopSimulation} overrideCounts={overrideCounts} setOverrideCounts={setOverrideCounts} getAlertCount={getAlertCount} />}
           {currentView === 'Reports / Export' && <ExportView completedRuns={completedRuns} />}
         </div>

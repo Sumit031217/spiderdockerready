@@ -2,7 +2,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
-# MOVED TO simcore_db5 TO AUTO-GENERATE THE NEW TELEMETRY TABLE
+# Database connection
 SQLALCHEMY_DATABASE_URL = "postgresql://postgres:702073@localhost:5432/simcore_db5"
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
@@ -37,7 +37,7 @@ class AlertLog(Base):
     run = relationship("SimulationRun", back_populates="alerts")
 
 # ==========================================
-# CONFIGURATION PERSISTENCE TABLES
+# DEVICE CONFIGURATION TABLE
 # ==========================================
 class DeviceConfigDB(Base):
     __tablename__ = "device_configs"
@@ -52,7 +52,12 @@ class DeviceConfigDB(Base):
     alertCount = Column(Integer)
     packetChoice = Column(String)
     isPolygon = Column(Boolean)
-    polygon = Column(Text)  
+    polygon = Column(Text)
+    
+    # [NEW COLUMNS] Added to stop PostgreSQL from stripping KML file names & colors
+    envCategory = Column("envcategory", String, default="GENERAL")
+    color = Column("color", String, default="#3b82f6")
+    sourceFile = Column("sourcefile", String, default="Uploaded KML")
 
 class SchemaConfigDB(Base):
     __tablename__ = "schema_configs"
@@ -89,5 +94,5 @@ class TelemetryLogDB(Base):
     __tablename__ = "telemetry_logs"
     id = Column(Integer, primary_key=True, index=True)
     time = Column(String)
-    msg = Column(String)
+    msg = Column(Text)
     type = Column(String)
