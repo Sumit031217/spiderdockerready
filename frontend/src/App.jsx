@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   Shield, Settings, Server, MapPin, Trash2, CheckCircle, 
   Upload, Network, Clock, FileOutput, Save, BellDot, 
@@ -50,8 +50,8 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
   const [status, setStatus] = useState({ message: 'System Ready', type: 'info' });
 
   const safeDevices = Array.isArray(devices) ? devices : [];
-  const hardwareSensors = safeDevices.filter(d => d && d.type && !String(d.type).toUpperCase().includes('ENV'));
-  const environmentFeatures = safeDevices.filter(d => d && d.type && String(d.type).toUpperCase().includes('ENV'));
+  const hardwareSensors = useMemo(() => safeDevices.filter(d => d && d.type && !String(d.type).toUpperCase().includes('ENV')), [safeDevices]);
+  const environmentFeatures = useMemo(() => safeDevices.filter(d => d && d.type && String(d.type).toUpperCase().includes('ENV')), [safeDevices]);
 
   const syncDevicesToDB = async () => {
     try {
@@ -388,14 +388,14 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas }) 
   const safeSchemas = Array.isArray(sensorSchemas) ? sensorSchemas : [];
   const safeActiveDevices = Array.isArray(scenario?.activeDevices) ? scenario.activeDevices : [];
 
-  const configurableSensors = safeDevices.filter(d => {
+  const configurableSensors = useMemo(() => safeDevices.filter(d => {
       if (!d || !d.type || String(d.type).toUpperCase().includes('ENV')) return false;
       const hasPacketChoice = !!d.packetChoice;
       const isMissingPacket = hasPacketChoice && !safeSchemas.some(s => s && s.name && String(s.name).toUpperCase() === String(d.packetChoice).toUpperCase());
       return !isMissingPacket; 
-  });
+  }), [safeDevices, safeSchemas]);
 
-  const allSensorIds = configurableSensors.map(d => d.id).filter(Boolean);
+  const allSensorIds = useMemo(() => configurableSensors.map(d => d.id).filter(Boolean), [configurableSensors]);
   const isAllSelected = allSensorIds.length > 0 && allSensorIds.every(id => safeActiveDevices.includes(id));
   
   const handleSelectAll = () => {
@@ -492,8 +492,10 @@ const AlertGeneratorView = ({
     overrideCounts, setOverrideCounts, getAlertCount 
 }) => {
   const safeDevices = Array.isArray(devices) ? devices : [];
-  const activeFleet = safeDevices.filter(d => d && (scenario?.activeDevices || []).includes(d.id));
-  const targetTotalAlerts = activeFleet.reduce((acc, dev) => acc + getAlertCount(dev), 0);
+  
+  // Cache the fleet calculation to stop CPU thrashing
+  const activeFleet = useMemo(() => safeDevices.filter(d => d && (scenario?.activeDevices || []).includes(d.id)), [safeDevices, scenario]);
+  const targetTotalAlerts = useMemo(() => activeFleet.reduce((acc, dev) => acc + getAlertCount(dev), 0), [activeFleet, overrideCounts]);
 
   const handleChange = (e) => {
     const { name, value } = e.target;
@@ -566,10 +568,14 @@ const AlertGeneratorView = ({
 };
 
 // ==========================================
-// VIEW 4: TACTICAL MAP WITH LAYER CONTROL PANEL 
+// VIEW 4: TACTICAL MAP WITH LAYER CONTROL PANEL
 // ==========================================
 const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAlertsGenerated }) => {
-  const mapCenter = devices && devices.length > 0 && devices[0].lat ? [devices[0].lat, devices[0].lng] : [27.2285, 77.4320];
+  const safeDevices = Array.isArray(devices) ? devices : [];
+  const safeAlerts = Array.isArray(alerts) ? alerts : [];
+
+  const mapCenter = useMemo(() => safeDevices.length > 0 && safeDevices[0].lat ? [safeDevices[0].lat, safeDevices[0].lng] : [27.2285, 77.4320], [safeDevices]);
+  
   const [showAll, setShowAll] = useState(false);
   const [hiddenLayers, setHiddenLayers] = useState({});
 
@@ -581,27 +587,27 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
     setHiddenLayers(prev => ({ ...prev, [layerKey]: !prev[layerKey] }));
   };
 
-  const safeDevices = Array.isArray(devices) ? devices : [];
-  const safeAlerts = Array.isArray(alerts) ? alerts : [];
-
-  const kmlSources = Array.from(new Set(
+  // Cache Map Arrays to stop massive DOM lag during simulation
+  const kmlSources = useMemo(() => Array.from(new Set(
     safeDevices.filter(d => d && d.type && d.type.toUpperCase().includes('ENV')).map(d => d.sourceFile || 'Uploaded KML')
-  ));
+  )), [safeDevices]);
 
   const getSourceColor = (srcName) => {
     const match = safeDevices.find(d => (d.sourceFile || 'Uploaded KML') === srcName);
     return match ? (match.color || '#3b82f6') : '#3b82f6';
   };
 
-  const visibleDevices = safeDevices.filter(dev => {
+  const visibleDevices = useMemo(() => safeDevices.filter(dev => {
     if (!dev || !dev.type) return false;
     if (dev.type.toUpperCase().includes('ENV')) {
       return !hiddenLayers[dev.sourceFile || 'Uploaded KML'];
     }
     return !hiddenLayers['HARDWARE_SENSORS'];
-  });
+  }), [safeDevices, hiddenLayers]);
 
-  const displayedAlerts = (showAll ? safeAlerts : safeAlerts.slice(-1000)).filter(() => !hiddenLayers['LIVE_ALERTS']);
+  const displayedAlerts = useMemo(() => 
+    (showAll ? safeAlerts : safeAlerts.slice(-1000)).filter(() => !hiddenLayers['LIVE_ALERTS']), 
+  [safeAlerts, showAll, hiddenLayers]);
 
   return (
     <div className="p-6 space-y-6 max-w-[1600px] mx-auto h-[calc(100vh-4rem)] flex flex-col font-sans relative">
@@ -615,7 +621,6 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
         <div className="flex space-x-3">
             <div className="flex items-center space-x-2 bg-rose-950/40 border border-rose-900 rounded px-3 py-1">
                 <Target className="w-4 h-4 text-rose-500" />
-                {/* [FIX 3] Real uncapped total metric derived from DB/Progress, not the sliced map array */}
                 <span className="text-xs font-mono text-rose-400 font-bold">TOTAL GENERATED: {totalAlertsGenerated}</span>
             </div>
         </div>
@@ -691,22 +696,11 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
               <React.Fragment key={dev.id || Math.random()}>
                 {isEnv && dev.isPolygon && safePoly.length > 0 && (
                   isLine ? (
-                    <LeafletPolyline 
-                      positions={safePoly} 
-                      pathOptions={{ color: layerColor, weight: 2.5 }}
-                    >
+                    <LeafletPolyline positions={safePoly} pathOptions={{ color: layerColor, weight: 2.5 }}>
                       <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
                     </LeafletPolyline>
                   ) : (
-                    <LeafletPolygon 
-                      positions={safePoly} 
-                      pathOptions={{ 
-                        color: layerColor, 
-                        fillColor: layerColor, 
-                        fillOpacity: dev.envCategory === 'BUILDING' ? 0.55 : 0.35, 
-                        weight: dev.envCategory === 'PERIMETER' ? 3.5 : 1.5 
-                      }}
-                    >
+                    <LeafletPolygon positions={safePoly} pathOptions={{ color: layerColor, fillColor: layerColor, fillOpacity: dev.envCategory === 'BUILDING' ? 0.55 : 0.35, weight: dev.envCategory === 'PERIMETER' ? 3.5 : 1.5 }}>
                       <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
                     </LeafletPolygon>
                   )
@@ -763,7 +757,6 @@ const ExportView = ({ completedRuns }) => {
   const [rangeReportName, setRangeReportName] = useState('Custom_Time_Range_Report');
   const [isRangeGenerating, setIsRangeGenerating] = useState(false);
 
-  // [FIX 1b] Directly stream memory-efficient DB query on export instead of downloading all alerts
   const handleGenerate = async (run) => {
     setGeneratingId(run.id);
     try {
@@ -815,28 +808,32 @@ const ExportView = ({ completedRuns }) => {
   };
 
   const safeCompletedRuns = Array.isArray(completedRuns) ? completedRuns : [];
-  const filteredRuns = safeCompletedRuns.filter(run => 
-    run && run.scenarioName && String(run.scenarioName).toLowerCase().includes(searchTerm.toLowerCase())
-  );
-  const sortedRuns = [...filteredRuns].sort((a, b) => {
-    let aValue = a[sortConfig.key];
-    let bValue = b[sortConfig.key];
+  
+  // Cache the filtered/sorted lists to stop UI lag
+  const sortedRuns = useMemo(() => {
+    const filteredRuns = safeCompletedRuns.filter(run => 
+        run && run.scenarioName && String(run.scenarioName).toLowerCase().includes(searchTerm.toLowerCase())
+    );
+    return [...filteredRuns].sort((a, b) => {
+      let aValue = a[sortConfig.key];
+      let bValue = b[sortConfig.key];
 
-    if (sortConfig.key === 'timestamp') {
-        aValue = new Date(a.timestamp || 0).getTime();
-        bValue = new Date(b.timestamp || 0).getTime();
-    } else if (sortConfig.key === 'alertsGenerated') {
-        aValue = parseInt(a.alertsGenerated, 10) || 0;
-        bValue = parseInt(b.alertsGenerated, 10) || 0;
-    } else {
-        aValue = String(a.scenarioName || '').toLowerCase();
-        bValue = String(b.scenarioName || '').toLowerCase();
-    }
+      if (sortConfig.key === 'timestamp') {
+          aValue = new Date(a.timestamp || 0).getTime();
+          bValue = new Date(b.timestamp || 0).getTime();
+      } else if (sortConfig.key === 'alertsGenerated') {
+          aValue = parseInt(a.alertsGenerated, 10) || 0;
+          bValue = parseInt(b.alertsGenerated, 10) || 0;
+      } else {
+          aValue = String(a.scenarioName || '').toLowerCase();
+          bValue = String(b.scenarioName || '').toLowerCase();
+      }
 
-    if (aValue < bValue) return sortConfig.direction === 'asc' ? -1 : 1;
-    if (aValue > bValue) return sortConfig.direction === 'asc' ? 1 : -1;
-    return 0;
-  });
+      if (aValue < bValue) return sortConfig.direction === 'asc' ? -1 : 1;
+      if (aValue > bValue) return sortConfig.direction === 'asc' ? 1 : -1;
+      return 0;
+    });
+  }, [safeCompletedRuns, searchTerm, sortConfig]);
 
   return (
     <div className="p-6 max-w-[1200px] mx-auto space-y-6">
@@ -1005,7 +1002,6 @@ export default function App() {
                     setSimLogs(data.logs);
                 }
                 
-                // [FIX 2] Properly set rolling alerts instead of endlessly appending
                 if (data.is_running || (Array.isArray(data.map_alerts) && data.map_alerts.length > 0)) {
                     setActiveAlerts(Array.isArray(data.map_alerts) ? data.map_alerts : []);
                 }
@@ -1033,7 +1029,6 @@ export default function App() {
     if (activeFleet.length === 0) return alert("MISSION ABORT: No active sensors bound.");
     if (targetTotalAlerts <= 0) return alert("MISSION ABORT: Target payload is 0.");
 
-    // [FIX 2] Wipe old alert states cleanly before new run starts
     setSimIsRunning(true);
     setSimProgress(0);
     setActiveAlerts([]);
@@ -1072,7 +1067,6 @@ export default function App() {
     { name: 'Reports / Export', icon: FileOutput },
   ];
 
-  // Dynamic variable to ensure "TOTAL GENERATED" on map tracks the specific DB count accurately
   const totalAlertsGen = simIsRunning ? simProgress : (completedRuns.length > 0 ? completedRuns[0].alertsGenerated : 0);
 
   return (

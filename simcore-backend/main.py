@@ -5,6 +5,8 @@ import random
 import socket
 import time
 import threading
+import sys
+import os
 from io import StringIO
 from datetime import datetime, timezone
 from collections import deque
@@ -14,15 +16,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
-from geopy.distance import geodesic
 from shapely.geometry import Polygon as ShapelyPolygon, LineString as ShapelyLineString, Point as ShapelyPoint
+from shapely.ops import unary_union
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from database import SessionLocal, engine, Base, SimulationRun, AlertLog, DeviceConfigDB, SchemaConfigDB, ScenarioStateDB
 
 # ==========================================================
-# DATABASE INITIALIZATION & SILENT MIGRATION
+# SAFE ALERT ENGINE IMPORT
+# ==========================================================
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from src.alert_engine import AlertEngine
+except ModuleNotFoundError:
+    try:
+        from alert_engine import AlertEngine
+    except ModuleNotFoundError:
+        raise RuntimeError("CRITICAL: Could not find 'alert_engine.py'. Ensure it is saved in simcore-backend/")
+
+# ==========================================================
+# DATABASE INITIALIZATION
 # ==========================================================
 try:
     Base.metadata.create_all(bind=engine)
@@ -45,9 +60,6 @@ def get_db():
 app = FastAPI(title="SIMCORE v2.5 Backend")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ==========================================================
-# GLOBAL ENGINE STATE
-# ==========================================================
 engine_lock = threading.Lock()
 engine_state = {
     "is_running": False,
@@ -92,6 +104,17 @@ class RangeExportRequest(BaseModel):
     endTime: str
     reportName: Optional[str] = "Time_Range_Report"
 
+# ==========================================================
+# [SPEED OPTIMIZATION 1]: High-Performance Math (Replaces Slow Geopy)
+# ==========================================================
+def fast_destination(lat, lng, dist_m, bearing_deg):
+    R = 6378137.0
+    lat1, lng1 = math.radians(lat), math.radians(lng)
+    brng = math.radians(bearing_deg)
+    lat2 = math.asin(math.sin(lat1)*math.cos(dist_m/R) + math.cos(lat1)*math.sin(dist_m/R)*math.cos(brng))
+    lng2 = lng1 + math.atan2(math.sin(brng)*math.sin(dist_m/R)*math.cos(lat1), math.cos(dist_m/R)-math.sin(lat1)*math.sin(lat2))
+    return math.degrees(lat2), math.degrees(lng2)
+
 def generate_uniform_distance(min_range, max_range):
     return math.sqrt(random.uniform(min_range ** 2, max_range ** 2))
 
@@ -100,25 +123,24 @@ def determine_priority(distance):
     if distance <= 3500: return "MEDIUM"
     return "LOW"
 
-def build_dynamic_packet(alert, device, track_id, schema, separator):
+# ==========================================================
+# [SPEED OPTIMIZATION 2]: Pre-Sorted Schemas
+# ==========================================================
+def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator):
     clean_type = str(device.type).upper()
-    if not schema:
+    if not pre_sorted_schema:
         clean_id = str(device.id).replace("RADAR_", "").replace("CAM_", "").replace("PIDS_", "")
         if "PIDS" in clean_type:
-            packet = [clean_id, 25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1112, 0, 0, 0, 0, 0, track_id, 0]
-            return ",".join(map(str, packet))
+            return ",".join(map(str, [clean_id, 25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1112, 0, 0, 0, 0, 0, track_id, 0]))
         elif "CAM" in clean_type:
-            packet = [clean_id, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "Intrusion", 0, 0, 0]
-            return ",".join(map(str, packet))
+            return ",".join(map(str, [clean_id, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "Intrusion", 0, 0, 0]))
         else: 
             fov_start = (device.azimuth - (device.fov / 2)) % 360
             fov_end = (device.azimuth + (device.fov / 2)) % 360
-            packet = [clean_id, 9, round(device.lat, 6), round(device.lng, 6), 0, round(device.azimuth, 2), round(fov_start, 2), round(fov_end, 2), track_id, round(alert["latitude"], 8), round(alert["longitude"], 8), round(alert.get("distance_m", 0), 2), round(alert.get("bearing", 0), 2), 0, 95, int(time.time()), 0, "", 0, 0, 0]
-            return ",".join(map(str, packet))
+            return ",".join(map(str, [clean_id, 9, round(device.lat, 6), round(device.lng, 6), 0, round(device.azimuth, 2), round(fov_start, 2), round(fov_end, 2), track_id, round(alert["latitude"], 8), round(alert["longitude"], 8), round(alert.get("distance_m", 0), 2), round(alert.get("bearing", 0), 2), 0, 95, int(time.time()), 0, "", 0, 0, 0]))
 
     packet = []
-    sorted_schema = sorted(schema, key=lambda x: x.get('index', 0))
-    for field in sorted_schema:
+    for field in pre_sorted_schema:
         if field.get('staticValue') and str(field.get('staticValue')).strip() != "":
             packet.append(str(field.get('staticValue')).strip())
             continue
@@ -152,6 +174,9 @@ def build_dynamic_packet(alert, device, track_id, schema, separator):
         packet.append(str(val))
     return separator.join(packet)
 
+# ==========================================================
+# [SPEED OPTIMIZATION 3]: GEOS O(1) Spatial Indexing
+# ==========================================================
 def build_spatial_indices(env_devices):
     perimeters, buildings, vegetations, waterbodies, transport_lines = [], [], [], [], []
     for env in env_devices:
@@ -161,21 +186,22 @@ def build_spatial_indices(env_devices):
         
         shapely_coords = [(pt[1], pt[0]) for pt in poly_coords]
         try:
-            if "PERIMETER" in cat:
-                if len(shapely_coords) >= 3: perimeters.append(ShapelyPolygon(shapely_coords))
-            elif "BUILDING" in cat:
-                if len(shapely_coords) >= 3: buildings.append(ShapelyPolygon(shapely_coords))
-            elif "VEGETATION" in cat:
-                if len(shapely_coords) >= 3: vegetations.append(ShapelyPolygon(shapely_coords))
-            elif "WATER" in cat:
-                if len(shapely_coords) >= 3: waterbodies.append(ShapelyPolygon(shapely_coords))
-            elif "ROAD" in cat or "RAIL" in cat:
-                transport_lines.append(ShapelyLineString(shapely_coords))
-        except Exception:
-            continue
-    return perimeters, buildings, vegetations, waterbodies, transport_lines
+            if "PERIMETER" in cat and len(shapely_coords) >= 3: perimeters.append(ShapelyPolygon(shapely_coords))
+            elif "BUILDING" in cat and len(shapely_coords) >= 3: buildings.append(ShapelyPolygon(shapely_coords))
+            elif "VEGETATION" in cat and len(shapely_coords) >= 3: vegetations.append(ShapelyPolygon(shapely_coords))
+            elif "WATER" in cat and len(shapely_coords) >= 3: waterbodies.append(ShapelyPolygon(shapely_coords))
+            elif ("ROAD" in cat or "RAIL" in cat): transport_lines.append(ShapelyLineString(shapely_coords))
+        except Exception: continue
+        
+    return (
+        unary_union(perimeters) if perimeters else None,
+        unary_union(buildings) if buildings else None,
+        unary_union(vegetations) if vegetations else None,
+        unary_union(waterbodies) if waterbodies else None,
+        unary_union(transport_lines) if transport_lines else None
+    )
 
-def sample_spatial_point(d_obj, perimeters, buildings, vegetations, waterbodies, transport_lines):
+def sample_spatial_point(d_obj, p_union, b_union, v_union, w_union, t_union):
     clean_type = str(d_obj.type).upper()
     if "PIDS" in clean_type and d_obj.isPolygon and d_obj.polygon and len(d_obj.polygon) > 1:
         idx_poly = random.randint(0, len(d_obj.polygon) - 1)
@@ -185,23 +211,24 @@ def sample_spatial_point(d_obj, perimeters, buildings, vegetations, waterbodies,
         edge_lng = p1[1] + fraction * (p2[1] - p1[1])
         offset_dist = random.uniform(0, 10)
         offset_bearing = random.uniform(0, 360)
-        dest = geodesic(meters=offset_dist).destination((edge_lat, edge_lng), offset_bearing)
-        return round(dest.latitude, 8), round(dest.longitude, 8), round(offset_dist, 2), round(offset_bearing, 2), "HIGH"
+        dest_lat, dest_lng = fast_destination(edge_lat, edge_lng, offset_dist, offset_bearing)
+        return round(dest_lat, 8), round(dest_lng, 8), round(offset_dist, 2), round(offset_bearing, 2), "HIGH"
 
     for attempt in range(25):
         dist = generate_uniform_distance(d_obj.innerRange, d_obj.outerRange)
         bearing = random.uniform(d_obj.azimuth - (d_obj.fov / 2), d_obj.azimuth + (d_obj.fov / 2)) % 360 if "CAM" in clean_type else random.uniform(0, 360)
-        dest = geodesic(meters=dist).destination((d_obj.lat, d_obj.lng), bearing)
-        cand_lat, cand_lng = round(dest.latitude, 8), round(dest.longitude, 8)
+        
+        cand_lat, cand_lng = fast_destination(d_obj.lat, d_obj.lng, dist, bearing)
+        cand_lat, cand_lng = round(cand_lat, 8), round(cand_lng, 8)
         pt = ShapelyPoint(cand_lng, cand_lat)
 
-        if perimeters and not any(poly.contains(pt) for poly in perimeters): continue
-        if buildings and any(poly.contains(pt) for poly in buildings): continue
+        if p_union and not p_union.contains(pt): continue
+        if b_union and b_union.contains(pt): continue
 
         prob = 0.35
-        if transport_lines and any(line.distance(pt) < 0.00018 for line in transport_lines): prob = 0.95
-        elif vegetations and any(poly.contains(pt) for poly in vegetations): prob = 0.85
-        elif waterbodies and any(poly.contains(pt) for poly in waterbodies): prob = 0.08
+        if t_union and t_union.distance(pt) < 0.00018: prob = 0.95
+        elif v_union and v_union.contains(pt): prob = 0.85
+        elif w_union and w_union.contains(pt): prob = 0.08
 
         if random.random() <= prob:
             return cand_lat, cand_lng, round(dist, 2), round(bearing, 2), determine_priority(dist)
@@ -235,6 +262,17 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         with engine_lock: engine_state['is_running'] = False
         return
 
+    # Pre-calculate unified geometry indexes once!
+    p_union, b_union, v_union, w_union, t_union = build_spatial_indices(env_devices)
+    
+    # Pre-sort schemas to avoid doing it millions of times
+    schema_cache = {}
+    for s in schemas:
+        schema_cache[str(s.get('name', '')).upper()] = {
+            "schema": sorted(s.get('schema', []), key=lambda x: x.get('index', 0)),
+            "separator": str(s.get('separator', ','))
+        }
+
     db = SessionLocal()
     run_id = None
     try:
@@ -251,13 +289,10 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         with engine_lock:
             engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB START ERROR: {str(e)}", "type": "error"})
 
-    perimeters, buildings, vegetations, waterbodies, transport_lines = build_spatial_indices(env_devices)
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
     batch_step = 1 if total < 50 else min(25, max(1, total // 100))
     class DummyDev: pass
 
-    # [FIX 1] UI Deque + Chunk DB Saving guarantees 0 memory bloat and cleans old alerts instantly
     ui_alerts = deque(maxlen=1000)
     db_chunk = []
 
@@ -280,7 +315,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         d_obj.polygon = dev_dict.get('polygon', [])
         d_obj.packetChoice = dev_dict.get('packetChoice', '')
 
-        alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, perimeters, buildings, vegetations, waterbodies, transport_lines)
+        alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, p_union, b_union, v_union, w_union, t_union)
         track_id = idx + 1
         
         alert_data = {
@@ -299,15 +334,15 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         ui_alerts.append(alert_data)
         db_chunk.append(alert_data)
 
-        sel_schema = next((s['schema'] for s in schemas if s['name'].upper() == str(d_obj.packetChoice).upper()), None)
-        sel_sep = next((s['separator'] for s in schemas if s['name'].upper() == str(d_obj.packetChoice).upper()), ",")
+        cache_entry = schema_cache.get(str(d_obj.packetChoice).upper())
+        sel_schema = cache_entry['schema'] if cache_entry else None
+        sel_sep = cache_entry['separator'] if cache_entry else ","
 
         packet_string = build_dynamic_packet(alert_data, d_obj, track_id, sel_schema, sel_sep)
         try:
             udp_socket.sendto(packet_string.encode('utf-8'), (str(udpIp), int(udpPort)))
         except Exception: pass
 
-        # Database chunking completely prevents high RAM usage
         if len(db_chunk) >= 5000:
             db.bulk_insert_mappings(AlertLog, db_chunk)
             db.commit()
@@ -326,7 +361,6 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
 
     udp_socket.close()
 
-    # Final DB chunk flush
     if db_chunk:
         db.bulk_insert_mappings(AlertLog, db_chunk)
         db.commit()
@@ -377,7 +411,6 @@ def api_engine_stop():
     with engine_lock: engine_state["should_abort"] = True
     return {"status": "success"}
 
-# [FIX 2] Hard cap visual map return array to protect browser memory while retaining real data
 @app.get("/api/state/alerts")
 def get_active_alerts(db: Session = Depends(get_db)):
     last_run = db.query(SimulationRun).order_by(SimulationRun.id.desc()).first()
@@ -390,6 +423,7 @@ def get_active_alerts(db: Session = Depends(get_db)):
         } for a in alerts_query]
     return []
 
+# Also optimize Export generation math to instantly build KMLs
 def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
     csv_io = StringIO()
     writer = csv.writer(csv_io)
@@ -431,8 +465,8 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
                 arc_points = []
                 angle = start_bearing
                 while True:
-                    pt = geodesic(meters=outerRange).destination((lat, lng), angle)
-                    arc_points.append(f"{pt.longitude},{pt.latitude},0")
+                    pt_lat, pt_lng = fast_destination(lat, lng, outerRange, angle)
+                    arc_points.append(f"{pt_lng},{pt_lat},0")
                     angle = (angle + 2) % 360
                     if abs((angle - end_bearing + 360) % 360) < 2: break
                 kml += f'<Placemark><name>{dev_id} FOV</name><Style><LineStyle><color>66ff0000</color><width>1</width></LineStyle><PolyStyle><color>2200ff00</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>{lng},{lat},0 {" ".join(arc_points)} {lng},{lat},0</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
@@ -440,10 +474,10 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
                 outerRange, innerRange = float(dev.get("outerRange", 100.0)), float(dev.get("innerRange", 0.0))
                 outer_pts, inner_pts = [], []
                 for angle in range(361):
-                    opt = geodesic(meters=outerRange).destination((lat, lng), angle)
-                    ipt = geodesic(meters=innerRange).destination((lat, lng), angle)
-                    outer_pts.append(f"{opt.longitude},{opt.latitude},0")
-                    inner_pts.append(f"{ipt.longitude},{ipt.latitude},0")
+                    opt_lat, opt_lng = fast_destination(lat, lng, outerRange, angle)
+                    ipt_lat, ipt_lng = fast_destination(lat, lng, innerRange, angle)
+                    outer_pts.append(f"{opt_lng},{opt_lat},0")
+                    inner_pts.append(f"{ipt_lng},{ipt_lat},0")
                 kml += f'<Placemark><name>{dev_id} Boundary</name><LineString><coordinates>{" ".join(outer_pts)}</coordinates></LineString></Placemark><Placemark><name>{dev_id} Exclusion</name><LineString><coordinates>{" ".join(inner_pts)}</coordinates></LineString></Placemark>'
 
     for alert in alerts:
@@ -456,7 +490,6 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
     kml += "\n</Document>\n</kml>"
     return {"csv_content": csv_io.getvalue(), "kml_content": kml}
 
-# [FIX 3] Strip alerts from /runs API so frontend never downloads ~200MB DB into RAM on page load
 @app.get("/api/runs")
 def get_all_runs(db: Session = Depends(get_db)):
     runs = db.query(SimulationRun).order_by(SimulationRun.id.desc()).all()
@@ -465,7 +498,6 @@ def get_all_runs(db: Session = Depends(get_db)):
         "timestamp": r.timestamp, "devices": json.loads(r.devices_snapshot) if r.devices_snapshot else []
     } for r in runs]
 
-# New precise endpoint that creates report dynamically without pushing DB into browser memory
 @app.get("/api/export/run/{run_id}")
 def export_specific_run(run_id: int, db: Session = Depends(get_db)):
     run = db.query(SimulationRun).filter(SimulationRun.id == run_id).first()
