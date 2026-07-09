@@ -47,28 +47,22 @@ const parseKmlColor = (kmlHex) => {
 // ==========================================
 // MODULE 1: DEVICE CONFIGURATION
 // ==========================================
-const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas }) => {
+const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas, allWorkspaces, setCustomWorkspaces }) => {
   const [status, setStatus] = useState({ message: 'System Ready', type: 'info' });
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
 
   const safeDevices = Array.isArray(devices) ? devices : [];
-  
-  // Extract unique workspaces
-  const allWorkspaces = useMemo(() => Array.from(new Set(safeDevices.map(d => d.workspace || 'Default'))), [safeDevices]);
   const [activeWorkspace, setActiveWorkspace] = useState('Default');
 
-  // Set default workspace safely on load
   useEffect(() => {
     if (allWorkspaces.length > 0 && !allWorkspaces.includes(activeWorkspace)) {
       setActiveWorkspace(allWorkspaces[0]);
     }
   }, [allWorkspaces, activeWorkspace]);
 
-  // Filter UI tables by active workspace
   const hardwareSensors = useMemo(() => safeDevices.filter(d => d && d.type && !String(d.type).toUpperCase().includes('ENV') && (d.workspace || 'Default') === activeWorkspace), [safeDevices, activeWorkspace]);
   const environmentFeatures = useMemo(() => safeDevices.filter(d => d && d.type && String(d.type).toUpperCase().includes('ENV') && (d.workspace || 'Default') === activeWorkspace), [safeDevices, activeWorkspace]);
 
-  // Aggregate thousands of KML polygons into clean visual groups
   const fileGroups = useMemo(() => {
     const map = new Map();
     environmentFeatures.forEach(env => {
@@ -123,6 +117,15 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
     } catch (err) { alert("🚨 NETWORK CRASH:\nThe browser blocked the connection to Python.\n" + err.message); }
   };
 
+  const handleCreateWorkspace = () => {
+    if(newWorkspaceName.trim()) {
+        const wsName = newWorkspaceName.trim();
+        setCustomWorkspaces(prev => [...prev, wsName]);
+        setActiveWorkspace(wsName);
+    }
+    setNewWorkspaceName('');
+  };
+
   const handleSensorJsonUpload = async (event) => {
     const files = Array.from(event.target.files);
     if (!files.length) return;
@@ -165,7 +168,7 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
                     innerRange: parseFloat(d.InnerRange || 0), outerRange: parseFloat(d.OuterRange || 100),
                     azimuth: parseFloat(d.Azimuth || 0), fov: parseFloat(d.FOV || 360),
                     alertCount: parseInt(d.AlertCount || 0), packetChoice: d.PacketChoice || "", lat, lng, isPolygon, polygon: polygonArr,
-                    workspace: activeWorkspace // Assign to selected workspace
+                    workspace: activeWorkspace 
                 };
             });
             combinedSensors = [...combinedSensors, ...parsedSensors];
@@ -221,15 +224,25 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
             else if (fname.includes("WATER")) envCategory = "WATERBODY";
             else if (fname.includes("PERIMETER")) envCategory = "PERIMETER";
 
-            isolatedLayer.features.forEach((feat) => {
+            isolatedLayer.features.forEach((feat, idx) => {
+                // [FIX 1] Swap Coordinates so Leaflet plots them correctly! [lon, lat] -> [lat, lon]
+                const leafletCoords = feat.coordinates.map(coord => [coord[1], coord[0]]);
+                
+                // [FIX 2] Create an absolutely unique ID so database stops overwriting duplicate feature names
+                const uniqueId = `${activeWorkspace}_${file.name}_${feat.name}_${idx}_${Math.random().toString(36).substr(2, 5)}`;
+                
                 combinedEnvs.push({
-                    id: feat.name, type: "Environment", envCategory, sourceFile: file.name,
+                    id: uniqueId, 
+                    type: "Environment", 
+                    envCategory, 
+                    sourceFile: file.name,
                     isPolygon: feat.geometryType === 'Polygon' || feat.geometryType === 'LineString', 
-                    polygon: feat.coordinates,
-                    lat: feat.coordinates[0]?.[0] || 0, lng: feat.coordinates[0]?.[1] || 0,
+                    polygon: leafletCoords,
+                    lat: leafletCoords[0]?.[0] || 0, 
+                    lng: leafletCoords[0]?.[1] || 0,
                     innerRange: 0, outerRange: 0, azimuth: 0, fov: 0, alertCount: 0, packetChoice: "",
                     color: feat.style.fillColor,
-                    workspace: activeWorkspace // Assign to selected workspace
+                    workspace: activeWorkspace 
                 });
             });
         } catch (err) { alert(`🚨 KML SYNTAX ERROR in ${file.name}!`); }
@@ -265,7 +278,6 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
         <div className={`px-4 py-2 rounded font-mono text-xs font-bold border ${status.type === 'error' ? 'bg-rose-950/50 border-rose-800 text-rose-400' : 'bg-emerald-950/50 border-emerald-800 text-emerald-400'}`}>{status.message}</div>
       </div>
 
-      {/* WORKSPACE SELECTION HEADER */}
       <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
           <div className="flex items-center space-x-4">
               <Briefcase className="w-6 h-6 text-emerald-400" />
@@ -279,14 +291,11 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
           </div>
           <div className="flex items-center space-x-2 bg-slate-950 p-2 rounded border border-slate-800">
               <input type="text" value={newWorkspaceName} onChange={e => setNewWorkspaceName(e.target.value)} placeholder="New Workspace Name..." className="bg-transparent px-2 py-1 text-sm text-slate-200 outline-none w-48" />
-              <button onClick={() => { if(newWorkspaceName) setActiveWorkspace(newWorkspaceName.trim()); setNewWorkspaceName(''); }} className="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold py-1.5 px-4 rounded text-xs transition-colors cursor-pointer">CREATE & SELECT</button>
+              <button onClick={handleCreateWorkspace} className="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold py-1.5 px-4 rounded text-xs transition-colors cursor-pointer">CREATE & SELECT</button>
           </div>
       </div>
 
-      {/* --- UI UPDATE: 3-COLUMN PARALLEL GRID --- */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        
-        {/* Global Input */}
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 shadow-sm flex flex-col relative overflow-hidden">
           <div className="absolute top-0 left-0 w-full h-1 bg-fuchsia-500"></div>
           <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-1 flex items-center"><Settings className="w-4 h-4 mr-2 text-fuchsia-400"/> Global Packet Formats</h3>
@@ -298,7 +307,6 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
           </div>
         </div>
 
-        {/* Workspace Input 1 */}
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 shadow-sm flex flex-col relative overflow-hidden">
           <div className="absolute top-0 left-0 w-full h-1 bg-emerald-500"></div>
           <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-1 flex items-center"><Target className="w-4 h-4 mr-2 text-rose-400"/> Sensor Array Input</h3>
@@ -310,7 +318,6 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
           </div>
         </div>
 
-        {/* Workspace Input 2 */}
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 shadow-sm flex flex-col relative overflow-hidden">
           <div className="absolute top-0 left-0 w-full h-1 bg-emerald-500"></div>
           <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-1 flex items-center"><MapPin className="w-4 h-4 mr-2 text-cyan-400"/> Environment Input</h3>
@@ -321,10 +328,8 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
             <p className="text-sm font-bold text-slate-300">Upload Environment (.KML)</p>
           </div>
         </div>
-
       </div>
 
-      {/* DATA TABLES */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 mt-6">
         <div className="xl:col-span-2 bg-slate-900 border border-slate-800 rounded-lg flex flex-col overflow-hidden shadow-sm h-[380px]">
           <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex justify-between items-center">
@@ -446,16 +451,13 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
 // ==========================================
 // MODULE 2: SCENARIO BUILDER
 // ==========================================
-const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas }) => {
+const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, allWorkspaces }) => {
   const [status, setStatus] = useState('');
   
   const safeDevices = Array.isArray(devices) ? devices : [];
   const safeSchemas = Array.isArray(sensorSchemas) ? sensorSchemas : [];
   const safeActiveDevices = Array.isArray(scenario?.activeDevices) ? scenario.activeDevices : [];
   
-  const allWorkspaces = useMemo(() => Array.from(new Set(safeDevices.map(d => d.workspace || 'Default'))), [safeDevices]);
-
-  // SCOPE AVAILABLE SENSORS STRICTLY TO THE SELECTED SCENARIO WORKSPACE
   const configurableSensors = useMemo(() => safeDevices.filter(d => {
       if (!d || !d.type || String(d.type).toUpperCase().includes('ENV')) return false;
       if ((d.workspace || 'Default') !== (scenario?.workspace || 'Default')) return false;
@@ -815,7 +817,7 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
         <MapContainer key={mapCenter.join(',')} center={mapCenter} zoom={13} className="h-full w-full z-0" style={{ background: '#f8fafc' }} preferCanvas={true}>
           <TileLayer attribution='&copy; CartoDB' url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png" />
           
-          {visibleDevices.map((dev) => {
+          {visibleDevices.map((dev, idx) => {
             if (!dev || !dev.type) return null;
             const isEnv = dev.type.toUpperCase().includes('ENV');
             const isCam = dev.type.toUpperCase().includes('CAM');
@@ -825,7 +827,7 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
             const isLine = ['ROAD', 'RAILWAY'].includes(dev.envCategory);
             
             return (
-              <React.Fragment key={dev.id || Math.random()}>
+              <React.Fragment key={dev.id || `dev-${idx}`}>
                 {isEnv && dev.isPolygon && safePoly.length > 0 && (
                   isLine ? (
                     <LeafletPolyline positions={safePoly} pathOptions={{ color: layerColor, weight: 2.5 }}>
@@ -1075,6 +1077,9 @@ export default function App() {
   const [dbStatus, setDbStatus] = useState('Checking...');
   const [sensorSchemas, setSensorSchemas] = useState([]); 
   const [devices, setDevices] = useState([]);
+  
+  const [customWorkspaces, setCustomWorkspaces] = useState(['Default']);
+
   const [scenario, setScenario] = useState({ name: 'Operation Alpha', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: 'Default' });
   const [alertConfig, setAlertConfig] = useState({ minDelaySec: 0.0001, maxDelaySec: 0.0005 });
   const [completedRuns, setCompletedRuns] = useState([]);
@@ -1094,6 +1099,12 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('simcore_telemetry', JSON.stringify(simLogs));
   }, [simLogs]);
+
+  const allWorkspaces = useMemo(() => {
+      const wsSet = new Set(devices.map(d => d.workspace || 'Default'));
+      customWorkspaces.forEach(ws => wsSet.add(ws));
+      return Array.from(wsSet);
+  }, [devices, customWorkspaces]);
 
   const getAlertCount = (dev) => overrideCounts[dev.id] !== undefined ? overrideCounts[dev.id] : (dev.alertCount || 0);
 
@@ -1127,22 +1138,33 @@ export default function App() {
             .then(res => res.json())
             .then(data => {
                 if(!data) return;
-                setSimIsRunning(!!data.is_running);
-                setSimProgress(data.progress || 0); 
+                
+                setSimIsRunning(prev => prev === !!data.is_running ? prev : !!data.is_running);
+                setSimProgress(prev => prev === data.progress ? prev : (data.progress || 0)); 
                 
                 if (Array.isArray(data.logs) && data.logs.length > 0) {
-                    setSimLogs(data.logs);
+                    setSimLogs(prev => {
+                        if (prev.length === data.logs.length && !data.is_running) return prev;
+                        return data.logs;
+                    });
                 }
                 
                 if (data.is_running || (Array.isArray(data.map_alerts) && data.map_alerts.length > 0)) {
-                    setActiveAlerts(Array.isArray(data.map_alerts) ? data.map_alerts : []);
+                    setActiveAlerts(prev => {
+                        if (prev.length === data.map_alerts.length && !data.is_running) return prev;
+                        return Array.isArray(data.map_alerts) ? data.map_alerts : [];
+                    });
                 }
                 
                 if (previousRunningState.current === true && data.is_running === false) {
                     fetchHistory();
                     fetch('http://127.0.0.1:8000/api/state/alerts')
                         .then(r => r.json())
-                        .then(alerts => setActiveAlerts(Array.isArray(alerts) ? alerts : []));
+                        .then(alerts => setActiveAlerts(prev => {
+                            const newAlerts = Array.isArray(alerts) ? alerts : [];
+                            if (prev.length === newAlerts.length) return prev;
+                            return newAlerts;
+                        }));
                 }
                 previousRunningState.current = !!data.is_running;
             })
@@ -1155,7 +1177,6 @@ export default function App() {
   const startSimulation = async () => {
     const safeDevices = Array.isArray(devices) ? devices : [];
     
-    // STRICTLY FILTER FLEET TO ACTIVE WORKSPACE
     const activeFleet = safeDevices.filter(d => d && (scenario?.activeDevices || []).includes(d.id));
     const environmentFleet = safeDevices.filter(d => d && d.type && String(d.type).toUpperCase().includes('ENV') && d.workspace === scenario?.workspace);
     
@@ -1239,8 +1260,8 @@ export default function App() {
         </header>
         
         <div className="flex-1 overflow-y-auto">
-          {currentView === 'Device Configuration' && <DeviceConfigView devices={devices} setDevices={setDevices} sensorSchemas={sensorSchemas} setSensorSchemas={setSensorSchemas} />}
-          {currentView === 'Scenario Builder' && <ScenarioBuilderView devices={devices} scenario={scenario} setScenario={setScenario} sensorSchemas={sensorSchemas} />}
+          {currentView === 'Device Configuration' && <DeviceConfigView devices={devices} setDevices={setDevices} sensorSchemas={sensorSchemas} setSensorSchemas={setSensorSchemas} allWorkspaces={allWorkspaces} setCustomWorkspaces={setCustomWorkspaces} />}
+          {currentView === 'Scenario Builder' && <ScenarioBuilderView devices={devices} scenario={scenario} setScenario={setScenario} sensorSchemas={sensorSchemas} allWorkspaces={allWorkspaces} />}
           {currentView === 'Tactical Map' && <MapView devices={devices} alerts={activeAlerts} simIsRunning={simIsRunning} simProgress={simProgress} totalAlertsGenerated={totalAlertsGen} activeWorkspace={scenario?.workspace || 'Default'} />}
           {currentView === 'Alert Generator' && <AlertGeneratorView devices={devices} scenario={scenario} alertConfig={alertConfig} setAlertConfig={setAlertConfig} setCompletedRuns={setCompletedRuns} setActiveAlerts={setActiveAlerts} sensorSchemas={sensorSchemas} simIsRunning={simIsRunning} simLogs={simLogs} simProgress={simProgress} startSimulation={startSimulation} stopSimulation={stopSimulation} overrideCounts={overrideCounts} setOverrideCounts={setOverrideCounts} getAlertCount={getAlertCount} />}
           {currentView === 'Reports / Export' && <ExportView completedRuns={completedRuns} />}

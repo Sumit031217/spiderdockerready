@@ -42,8 +42,6 @@ except ModuleNotFoundError:
 try:
     Base.metadata.create_all(bind=engine)
     print("SUCCESS: Connected to PostgreSQL Database.")
-    
-    # [FIX] Use independent AUTOCOMMIT so existing columns don't block the new workspace columns
     with engine.connect() as conn:
         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         try: conn.execute(text("ALTER TABLE device_configs ADD COLUMN envcategory VARCHAR DEFAULT 'GENERAL';"))
@@ -56,7 +54,6 @@ try:
         except: pass
         try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN workspace VARCHAR DEFAULT 'Default';"))
         except: pass
-
 except Exception as e:
     print("\nWARNING: Could not connect to PostgreSQL Database:", e)
 
@@ -194,6 +191,8 @@ def build_spatial_indices(env_devices):
         poly_coords = env.get("polygon", [])
         if not poly_coords or len(poly_coords) < 2: continue
         
+        # In the new frontend logic, poly_coords are purely [lat, lon]
+        # Shapely expects (x, y) which is (lon, lat), so we map pt[1], pt[0]
         shapely_coords = [(pt[1], pt[0]) for pt in poly_coords]
         try:
             if "PERIMETER" in cat and len(shapely_coords) >= 3: perimeters.append(ShapelyPolygon(shapely_coords))
@@ -512,10 +511,11 @@ def get_saved_devices(db: Session = Depends(get_db)):
     devices = db.query(DeviceConfigDB).all()
     return [{"id": d.id, "type": d.type, "lat": d.lat, "lng": d.lng, "innerRange": d.innerRange, "outerRange": d.outerRange, "azimuth": d.azimuth, "fov": d.fov, "alertCount": d.alertCount, "packetChoice": d.packetChoice, "isPolygon": d.isPolygon, "polygon": json.loads(d.polygon) if d.polygon else [], "envCategory": getattr(d, 'envCategory', 'GENERAL'), "color": getattr(d, 'color', '#3b82f6'), "sourceFile": getattr(d, 'sourceFile', 'Uploaded KML'), "workspace": getattr(d, 'workspace', 'Default')} for d in devices]
 
+# [FIX] Bulk DB Insert to prevent timeouts during large KML saves
 @app.post("/api/config/devices")
 def save_devices(payload: List[DeviceModel], db: Session = Depends(get_db)):
-    for dev in payload:
-        try:
+    try:
+        for dev in payload:
             db_dev = db.query(DeviceConfigDB).filter(DeviceConfigDB.id == dev.id).first()
             poly_str = json.dumps(dev.polygon) if dev.polygon else "[]"
             if db_dev:
@@ -531,8 +531,11 @@ def save_devices(payload: List[DeviceModel], db: Session = Depends(get_db)):
             else:
                 new_dev = DeviceConfigDB(id=str(dev.id), type=str(dev.type), lat=float(dev.lat), lng=float(dev.lng), innerRange=float(dev.innerRange), outerRange=float(dev.outerRange), azimuth=float(dev.azimuth), fov=float(dev.fov), alertCount=int(dev.alertCount), packetChoice=str(dev.packetChoice), isPolygon=bool(dev.isPolygon), polygon=poly_str, envCategory=str(dev.envCategory or "GENERAL"), color=str(dev.color or "#3b82f6"), sourceFile=str(dev.sourceFile or "Uploaded KML"), workspace=str(dev.workspace or "Default"))
                 db.add(new_dev)
-            db.commit()
-        except Exception: db.rollback()
+        # Commit once outside the loop!
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "message": str(e)}
     return {"status": "success"}
 
 @app.delete("/api/config/devices/{device_id}")
@@ -541,7 +544,6 @@ def delete_device(device_id: str, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success"}
 
-# [NEW] Ultra-fast Batch Delete Endpoint for Files
 @app.post("/api/config/devices/delete_batch")
 def delete_device_batch(payload: DeleteBatchRequest, db: Session = Depends(get_db)):
     if payload.ids:
@@ -554,10 +556,11 @@ def get_saved_schemas(db: Session = Depends(get_db)):
     schemas = db.query(SchemaConfigDB).all()
     return [{"name": s.name, "separator": s.separator, "totalIndexes": s.totalIndexes, "schema": json.loads(s.schema_data) if s.schema_data else []} for s in schemas]
 
+# [FIX] Bulk DB Insert for schemas
 @app.post("/api/config/schemas")
 def save_schemas(payload: List[SchemaModel], db: Session = Depends(get_db)):
-    for s in payload:
-        try:
+    try:
+        for s in payload:
             db_schema = db.query(SchemaConfigDB).filter(SchemaConfigDB.name == s.name).first()
             schema_str = json.dumps(s.schema_data) if s.schema_data else "[]"
             if db_schema:
@@ -565,8 +568,10 @@ def save_schemas(payload: List[SchemaModel], db: Session = Depends(get_db)):
             else:
                 new_schema = SchemaConfigDB(name=str(s.name), separator=str(s.separator), totalIndexes=int(s.totalIndexes), schema_data=schema_str)
                 db.add(new_schema)
-            db.commit()
-        except Exception: db.rollback()
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "message": str(e)}
     return {"status": "success"}
 
 @app.delete("/api/config/schemas/{schema_name}")
