@@ -2,6 +2,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
+# Database connection
 SQLALCHEMY_DATABASE_URL = "postgresql://postgres:702073@localhost:5432/simcore_db5"
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
@@ -56,7 +57,6 @@ class DeviceConfigDB(Base):
     envCategory = Column("envcategory", String, default="GENERAL")
     color = Column("color", String, default="#3b82f6")
     sourceFile = Column("sourcefile", String, default="Uploaded KML")
-    # [NEW] Workspace Column
     workspace = Column("workspace", String, default="Default")
 
 class SchemaConfigDB(Base):
@@ -76,8 +76,10 @@ class ScenarioStateDB(Base):
     activeDevices = Column(Text) 
     udpIp = Column(String)
     udpPort = Column(Integer)
-    # [NEW] Track Scenario Workspace Selection
     workspace = Column(String, default="Default")
+    
+    # [NEW] Store custom probabilities for KML files in this scenario
+    kmlProbabilities = Column(Text, default="{}") 
 
 class ActiveAlertDB(Base):
     __tablename__ = "active_alerts"

@@ -54,6 +54,8 @@ try:
         except: pass
         try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN workspace VARCHAR DEFAULT 'Default';"))
         except: pass
+        try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN kmlprobabilities TEXT DEFAULT '{}';"))
+        except: pass
 except Exception as e:
     print("\nWARNING: Could not connect to PostgreSQL Database:", e)
 
@@ -105,6 +107,7 @@ class ScenarioModel(BaseModel):
     udpIp: str
     udpPort: int
     workspace: Optional[str] = "Default"
+    kmlProbabilities: Optional[dict] = {}
 
 class RangeExportRequest(BaseModel):
     startTime: str
@@ -182,35 +185,46 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator):
     return separator.join(packet)
 
 # ==========================================================
-# SPATIAL ENGINE
+# SPATIAL ENGINE WITH DYNAMIC PROBABILITIES
 # ==========================================================
 def build_spatial_indices(env_devices):
-    perimeters, buildings, vegetations, waterbodies, transport_lines = [], [], [], [], []
+    # Returns dictionaries mapping KML Source Files -> Unified Geometries
+    perimeters, buildings, vegetations, waterbodies, transport_lines = {}, {}, {}, {}, {}
+    
+    # Temporary lists to group polygons by file
+    groups = {
+        "PERIMETER": {}, "BUILDING": {}, "VEGETATION": {}, "WATER": {}, "TRANSPORT": {}
+    }
+
     for env in env_devices:
         cat = str(env.get("envCategory", "")).upper()
         poly_coords = env.get("polygon", [])
+        src_file = env.get("sourceFile", "Uploaded KML")
         if not poly_coords or len(poly_coords) < 2: continue
         
-        # In the new frontend logic, poly_coords are purely [lat, lon]
-        # Shapely expects (x, y) which is (lon, lat), so we map pt[1], pt[0]
         shapely_coords = [(pt[1], pt[0]) for pt in poly_coords]
         try:
-            if "PERIMETER" in cat and len(shapely_coords) >= 3: perimeters.append(ShapelyPolygon(shapely_coords))
-            elif "BUILDING" in cat and len(shapely_coords) >= 3: buildings.append(ShapelyPolygon(shapely_coords))
-            elif "VEGETATION" in cat and len(shapely_coords) >= 3: vegetations.append(ShapelyPolygon(shapely_coords))
-            elif "WATER" in cat and len(shapely_coords) >= 3: waterbodies.append(ShapelyPolygon(shapely_coords))
-            elif ("ROAD" in cat or "RAIL" in cat): transport_lines.append(ShapelyLineString(shapely_coords))
+            if "PERIMETER" in cat and len(shapely_coords) >= 3:
+                groups["PERIMETER"].setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
+            elif "BUILDING" in cat and len(shapely_coords) >= 3:
+                groups["BUILDING"].setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
+            elif "VEGETATION" in cat and len(shapely_coords) >= 3:
+                groups["VEGETATION"].setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
+            elif "WATER" in cat and len(shapely_coords) >= 3:
+                groups["WATER"].setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
+            elif ("ROAD" in cat or "RAIL" in cat):
+                groups["TRANSPORT"].setdefault(src_file, []).append(ShapelyLineString(shapely_coords))
         except Exception: continue
         
-    return (
-        unary_union(perimeters) if perimeters else None,
-        unary_union(buildings) if buildings else None,
-        unary_union(vegetations) if vegetations else None,
-        unary_union(waterbodies) if waterbodies else None,
-        unary_union(transport_lines) if transport_lines else None
-    )
+    for f, items in groups["PERIMETER"].items(): perimeters[f] = unary_union(items)
+    for f, items in groups["BUILDING"].items(): buildings[f] = unary_union(items)
+    for f, items in groups["VEGETATION"].items(): vegetations[f] = unary_union(items)
+    for f, items in groups["WATER"].items(): waterbodies[f] = unary_union(items)
+    for f, items in groups["TRANSPORT"].items(): transport_lines[f] = unary_union(items)
 
-def sample_spatial_point(d_obj, p_union, b_union, v_union, w_union, t_union):
+    return perimeters, buildings, vegetations, waterbodies, transport_lines
+
+def sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions, kml_probs):
     clean_type = str(d_obj.type).upper()
     if "PIDS" in clean_type and d_obj.isPolygon and d_obj.polygon and len(d_obj.polygon) > 1:
         idx_poly = random.randint(0, len(d_obj.polygon) - 1)
@@ -231,23 +245,61 @@ def sample_spatial_point(d_obj, p_union, b_union, v_union, w_union, t_union):
         cand_lat, cand_lng = round(cand_lat, 8), round(cand_lng, 8)
         pt = ShapelyPoint(cand_lng, cand_lat)
 
-        if p_union and not p_union.contains(pt): continue
-        if b_union and b_union.contains(pt): continue
+        # 1. PERIMETER LOGIC (Contains check)
+        is_outside_perimeters = False
+        for fname, poly in p_unions.items():
+            if not poly.contains(pt):
+                is_outside_perimeters = True
+                break
+        if is_outside_perimeters: continue
+        
+        # 2. BUILDING REJECTION LOGIC
+        inside_building = False
+        for fname, poly in b_unions.items():
+            if poly.contains(pt):
+                # Retrieve custom user probability, default to 0.0
+                prob = kml_probs.get(fname, 0.0)
+                if random.random() > prob: 
+                    inside_building = True
+                    break
+        if inside_building: continue
 
-        prob = 0.35
-        if t_union and t_union.distance(pt) < 0.00018: prob = 0.95
-        elif v_union and v_union.contains(pt): prob = 0.85
-        elif w_union and w_union.contains(pt): prob = 0.08
+        # 3. BASE PROBABILITY (Free Terrain)
+        final_prob = 0.35 
+        matched_feature = False
+        
+        # 4. TRANSPORT LOGIC
+        for fname, line in t_unions.items():
+            if line.distance(pt) < 0.00018:
+                final_prob = kml_probs.get(fname, 0.95)
+                matched_feature = True
+                break
+                
+        # 5. VEGETATION LOGIC
+        if not matched_feature:
+            for fname, poly in v_unions.items():
+                if poly.contains(pt):
+                    final_prob = kml_probs.get(fname, 0.85)
+                    matched_feature = True
+                    break
+        
+        # 6. WATER LOGIC
+        if not matched_feature:
+            for fname, poly in w_unions.items():
+                if poly.contains(pt):
+                    final_prob = kml_probs.get(fname, 0.08)
+                    break
 
-        if random.random() <= prob:
+        if random.random() <= final_prob:
             return cand_lat, cand_lng, round(dist, 2), round(bearing, 2), determine_priority(dist)
 
+    # Fallback if it exceeds 25 attempts
     return cand_lat, cand_lng, round(dist, 2), round(bearing, 2), determine_priority(dist)
 
 # ==========================================================
 # THE HIGH PERFORMANCE ENGINE WORKER
 # ==========================================================
-def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay):
+def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs):
     global engine_state
     
     pool = []
@@ -270,7 +322,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         with engine_lock: engine_state['is_running'] = False
         return
 
-    p_union, b_union, v_union, w_union, t_union = build_spatial_indices(env_devices)
+    p_unions, b_unions, v_unions, w_unions, t_unions = build_spatial_indices(env_devices)
     
     schema_cache = {}
     for s in schemas:
@@ -321,7 +373,8 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         d_obj.polygon = dev_dict.get('polygon', [])
         d_obj.packetChoice = dev_dict.get('packetChoice', '')
 
-        alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, p_union, b_union, v_union, w_union, t_union)
+        # Pass custom KML probabilities into point sampler
+        alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions, kml_probs)
         track_id = idx + 1
         
         alert_data = {
@@ -388,7 +441,8 @@ def api_engine_start(payload: dict):
         args=(
             payload["scenarioName"], payload["udpIp"], payload["udpPort"],
             payload["activeDevices"], payload["environmentDevices"], payload["sensorSchemas"],
-            payload["alertConfig"]["minDelaySec"], payload["alertConfig"]["maxDelaySec"]
+            payload["alertConfig"]["minDelaySec"], payload["alertConfig"]["maxDelaySec"],
+            payload.get("kmlProbabilities", {})
         ),
         daemon=True
     )
@@ -511,7 +565,6 @@ def get_saved_devices(db: Session = Depends(get_db)):
     devices = db.query(DeviceConfigDB).all()
     return [{"id": d.id, "type": d.type, "lat": d.lat, "lng": d.lng, "innerRange": d.innerRange, "outerRange": d.outerRange, "azimuth": d.azimuth, "fov": d.fov, "alertCount": d.alertCount, "packetChoice": d.packetChoice, "isPolygon": d.isPolygon, "polygon": json.loads(d.polygon) if d.polygon else [], "envCategory": getattr(d, 'envCategory', 'GENERAL'), "color": getattr(d, 'color', '#3b82f6'), "sourceFile": getattr(d, 'sourceFile', 'Uploaded KML'), "workspace": getattr(d, 'workspace', 'Default')} for d in devices]
 
-# [FIX] Bulk DB Insert to prevent timeouts during large KML saves
 @app.post("/api/config/devices")
 def save_devices(payload: List[DeviceModel], db: Session = Depends(get_db)):
     try:
@@ -531,7 +584,6 @@ def save_devices(payload: List[DeviceModel], db: Session = Depends(get_db)):
             else:
                 new_dev = DeviceConfigDB(id=str(dev.id), type=str(dev.type), lat=float(dev.lat), lng=float(dev.lng), innerRange=float(dev.innerRange), outerRange=float(dev.outerRange), azimuth=float(dev.azimuth), fov=float(dev.fov), alertCount=int(dev.alertCount), packetChoice=str(dev.packetChoice), isPolygon=bool(dev.isPolygon), polygon=poly_str, envCategory=str(dev.envCategory or "GENERAL"), color=str(dev.color or "#3b82f6"), sourceFile=str(dev.sourceFile or "Uploaded KML"), workspace=str(dev.workspace or "Default"))
                 db.add(new_dev)
-        # Commit once outside the loop!
         db.commit()
     except Exception as e:
         db.rollback()
@@ -556,7 +608,6 @@ def get_saved_schemas(db: Session = Depends(get_db)):
     schemas = db.query(SchemaConfigDB).all()
     return [{"name": s.name, "separator": s.separator, "totalIndexes": s.totalIndexes, "schema": json.loads(s.schema_data) if s.schema_data else []} for s in schemas]
 
-# [FIX] Bulk DB Insert for schemas
 @app.post("/api/config/schemas")
 def save_schemas(payload: List[SchemaModel], db: Session = Depends(get_db)):
     try:
@@ -580,20 +631,48 @@ def delete_schema(schema_name: str, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success"}
 
-@app.get("/api/state/scenario")
-def get_scenario_state(db: Session = Depends(get_db)):
-    s = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == "current").first()
-    if s: return { "name": s.name, "activeDevices": json.loads(s.activeDevices), "udpIp": s.udpIp, "udpPort": s.udpPort, "workspace": getattr(s, 'workspace', 'Default') }
-    return { "name": "Operation Alpha", "activeDevices": [], "udpIp": "127.0.0.1", "udpPort": 5005, "workspace": "Default" }
+# ==========================================================
+# SCENARIO WORKSPACE STATE MANAGEMENT (Updated)
+# ==========================================================
+@app.get("/api/state/scenario/{workspace_name}")
+def get_scenario_state(workspace_name: str, db: Session = Depends(get_db)):
+    s = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == workspace_name).first()
+    if s: 
+        return { 
+            "name": s.name, 
+            "activeDevices": json.loads(s.activeDevices) if s.activeDevices else [], 
+            "udpIp": s.udpIp, 
+            "udpPort": s.udpPort, 
+            "workspace": s.workspace,
+            "kmlProbabilities": json.loads(s.kmlProbabilities) if s.kmlProbabilities else {}
+        }
+    return { "name": f"{workspace_name} Mission", "activeDevices": [], "udpIp": "127.0.0.1", "udpPort": 5005, "workspace": workspace_name, "kmlProbabilities": {} }
 
 @app.post("/api/state/scenario")
 def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
-    s = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == "current").first()
+    target_workspace = str(payload.workspace or "Default")
+    s = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == target_workspace).first()
+    
     dev_str = json.dumps(payload.activeDevices)
+    prob_str = json.dumps(payload.kmlProbabilities) if payload.kmlProbabilities else "{}"
+    
     if s:
-        s.name = payload.name; s.activeDevices = dev_str; s.udpIp = payload.udpIp; s.udpPort = payload.udpPort; s.workspace = str(payload.workspace or "Default")
+        s.name = payload.name
+        s.activeDevices = dev_str
+        s.udpIp = payload.udpIp
+        s.udpPort = payload.udpPort
+        s.workspace = target_workspace
+        s.kmlProbabilities = prob_str
     else:
-        new_s = ScenarioStateDB(id="current", name=payload.name, activeDevices=dev_str, udpIp=payload.udpIp, udpPort=payload.udpPort, workspace=str(payload.workspace or "Default"))
+        new_s = ScenarioStateDB(
+            id=target_workspace, 
+            name=payload.name, 
+            activeDevices=dev_str, 
+            udpIp=payload.udpIp, 
+            udpPort=payload.udpPort, 
+            workspace=target_workspace,
+            kmlProbabilities=prob_str
+        )
         db.add(new_s)
     db.commit()
     return {"status": "success"}
