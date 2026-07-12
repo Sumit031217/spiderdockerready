@@ -86,7 +86,7 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
 
   const syncDevicesToDB = async () => {
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/config/devices', {
+      const response = await fetch('/api/config/devices', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(safeDevices)
       });
@@ -102,7 +102,7 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
 
   const syncSchemasToDB = async () => {
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/config/schemas', {
+      const response = await fetch('/api/config/schemas', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(Array.isArray(sensorSchemas) ? sensorSchemas : [])
       });
@@ -249,14 +249,14 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
 
   const removeDevice = (id) => {
     setDevices(safeDevices.filter(d => d.id !== id));
-    fetch(`http://127.0.0.1:8000/api/config/devices/${id}`, { method: 'DELETE' }).catch(() => {});
+    fetch(`/api/config/devices/${id}`, { method: 'DELETE' }).catch(() => {});
   };
 
   const removeFileFeatures = async (ids) => {
     if (!window.confirm(`Are you sure you want to delete these ${ids.length} GIS features permanently?`)) return;
     setDevices(prev => prev.filter(d => !ids.includes(d.id)));
     try {
-        await fetch('http://127.0.0.1:8000/api/config/devices/delete_batch', {
+        await fetch('/api/config/devices/delete_batch', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids })
         });
     } catch (err) {}
@@ -264,7 +264,7 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
 
   const removeSchema = (name) => {
     setSensorSchemas((Array.isArray(sensorSchemas) ? sensorSchemas : []).filter(s => s.name !== name));
-    fetch(`http://127.0.0.1:8000/api/config/schemas/${name}`, { method: 'DELETE' }).catch(() => {});
+    fetch(`/api/config/schemas/${name}`, { method: 'DELETE' }).catch(() => {});
   };
 
   return (
@@ -549,7 +549,7 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
     const payloadToSave = { ...scenario, workspace: activeWorkspace };
 
     try {
-        const response = await fetch('http://127.0.0.1:8000/api/state/scenario', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payloadToSave) });
+        const response = await fetch('/api/state/scenario', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payloadToSave) });
         if (response.ok) {
             setStatus('Scenario compiled and State Saved to Database.');
             setTimeout(() => setStatus(''), 4000);
@@ -1026,7 +1026,7 @@ const ExportView = ({ completedRuns }) => {
   const handleGenerate = async (run) => {
     setGeneratingId(run.id);
     try {
-      const response = await fetch(`http://127.0.0.1:8000/api/export/run/${run.id}`);
+      const response = await fetch(`/api/export/run/${run.id}`);
       const data = await response.json();
 
       const kmlBlob = new Blob([data.kml_content], { type: 'application/vnd.google-earth.kml+xml' });
@@ -1046,7 +1046,7 @@ const ExportView = ({ completedRuns }) => {
     
     setIsRangeGenerating(true);
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/export/range', {
+      const response = await fetch('/api/export/range', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1250,42 +1250,42 @@ export default function App() {
   const getAlertCount = (dev) => overrideCounts[dev.id] !== undefined ? overrideCounts[dev.id] : (dev.alertCount || 0);
 
   const fetchHistory = () => {
-    fetch('http://127.0.0.1:8000/api/runs')
+    fetch('/api/runs')
       .then(res => res.json()).then(data => { if(Array.isArray(data)) setCompletedRuns(data); })
       .catch(e => console.error("History fetch failed"));
   };
 
   useEffect(() => {
     // NEW: Fetch Hardcoded Events from Backend
-    fetch('http://127.0.0.1:8000/api/config/sensor-events')
+    fetch('/api/config/sensor-events')
       .then(res => res.json())
       .then(data => setSensorEvents(data))
       .catch(e => console.error("Failed to load sensor events"));
 
-    fetch('http://127.0.0.1:8000/api/config/schemas')
+    fetch('/api/config/schemas')
       .then(res => { if (res.ok) { setDbStatus('CONNECTED'); return res.json(); } throw new Error(); })
       .then(data => { setSensorSchemas(Array.isArray(data) ? data : []); })
       .catch(e => setDbStatus('DISCONNECTED'));
 
-    fetch('http://127.0.0.1:8000/api/config/devices')
+    fetch('/api/config/devices')
       .then(res => res.json()).then(data => { setDevices(Array.isArray(data) ? data : []); }).catch(e => console.error(e));
 
     fetchHistory();
   }, []);
 
   useEffect(() => {
-    fetch(`http://127.0.0.1:8000/api/state/scenario/${activeWorkspace}`)
+    fetch(`/api/state/scenario/${activeWorkspace}`)
       .then(res => res.json()).then(data => { if(data && data.name) setScenario(data); }).catch(e => console.error(e));
   }, [activeWorkspace]);
 
   useEffect(() => {
-    fetch('http://127.0.0.1:8000/api/state/alerts')
+    fetch('/api/state/alerts')
       .then(res => res.json()).then(data => { setActiveAlerts(Array.isArray(data) ? data : []); }).catch(e => console.error(e));
   }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {
-        fetch('http://127.0.0.1:8000/api/engine/status')
+        fetch('/api/engine/status')
             .then(res => res.json())
             .then(data => {
                 if(!data) return;
@@ -1309,7 +1309,7 @@ export default function App() {
                 
                 if (previousRunningState.current === true && data.is_running === false) {
                     fetchHistory();
-                    fetch('http://127.0.0.1:8000/api/state/alerts')
+                    fetch('/api/state/alerts')
                         .then(r => r.json())
                         .then(alerts => setActiveAlerts(prev => {
                             const newAlerts = Array.isArray(alerts) ? alerts : [];
@@ -1357,7 +1357,7 @@ export default function App() {
     };
 
     try {
-        await fetch('http://127.0.0.1:8000/api/engine/start', {
+        await fetch('/api/engine/start', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
         });
     } catch (e) {
@@ -1367,7 +1367,7 @@ export default function App() {
   };
 
   const stopSimulation = () => {
-    fetch('http://127.0.0.1:8000/api/engine/stop', { method: 'POST' });
+    fetch('/api/engine/stop', { method: 'POST' });
   };
   // --- PASTE THIS NEW FUNCTION RIGHT BELOW stopSimulation ---
   const handleSensorEventsUpload = async (event) => {
@@ -1383,7 +1383,7 @@ export default function App() {
             throw new Error("Invalid format. Expected 'protocolName' and 'fields' array.");
         }
 
-        const response = await fetch('http://127.0.0.1:8000/api/config/sensor-events', {
+        const response = await fetch('/api/config/sensor-events', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(parsedData)
@@ -1392,7 +1392,7 @@ export default function App() {
         if (response.ok) {
             alert("✅ SUCCESS: Global Sensor Events saved to Database!");
             // Instantly refresh the UI dropdowns
-            const updatedEvents = await fetch('http://127.0.0.1:8000/api/config/sensor-events').then(res => res.json());
+            const updatedEvents = await fetch('/api/config/sensor-events').then(res => res.json());
             setSensorEvents(updatedEvents);
         } else {
             const errText = await response.text();
@@ -1409,7 +1409,7 @@ export default function App() {
         setActiveAlerts([]);
         // Clear Backend Engine Memory
         try {
-            await fetch('http://127.0.0.1:8000/api/engine/clear-alerts', { method: 'POST' });
+            await fetch('/api/engine/clear-alerts', { method: 'POST' });
         } catch (err) {
             console.error("Failed to clear backend memory:", err);
         }

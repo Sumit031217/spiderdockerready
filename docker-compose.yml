@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  # 1. POSTGRES DATABASE
+  db:
+    image: postgres:15-alpine
+    container_name: simcore_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 702073
+      POSTGRES_DB: simcore_db5
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+ # 2. FASTAPI BACKEND
+  backend:
+    build: ./simcore-backend
+    container_name: simcore_backend
+    ports:
+      - "5005:5005/udp" 
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://postgres:702073@db:5432/simcore_db5
+    volumes:
+      # --- ADD THIS LINE ---
+      # This links a new folder named 'simcore_uploads' on your Windows desktop 
+      # directly to the '/app/uploads' folder inside the container!
+      - ./simcore_uploads:/app/uploads
+
+  # 3. REACT FRONTEND (Now running Nginx)
+  frontend:
+    build: ./frontend
+    container_name: simcore_frontend
+    # Expose the single production port!
+    ports:
+      - "80:80" 
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
