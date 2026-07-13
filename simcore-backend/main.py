@@ -361,7 +361,10 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
             engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB START ERROR: {str(e)}", "type": "error"})
 
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    batch_step = 1 if total < 50 else min(25, max(1, total // 100))
+    
+    # REMOVED DYNAMIC THROTTLING: Always log 1-to-1 to the Telemetry UI
+    batch_step = 1 
+    
     class DummyDev: pass
 
     ui_alerts = deque(maxlen=1000)
