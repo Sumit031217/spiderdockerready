@@ -42,3 +42,11 @@ services:
 
 volumes:
   postgres_data:
+
+networks:
+  default:
+    ipam:
+      driver: default
+      config:
+        # Forces Docker to use a 10.x.x.x network, avoiding Wi-Fi clashes!
+        - subnet: 10.77.0.0/16
