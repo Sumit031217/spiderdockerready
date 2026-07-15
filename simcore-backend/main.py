@@ -23,9 +23,6 @@ from sqlalchemy import text
 from database import SessionLocal, engine, Base, SimulationRun, AlertLog, DeviceConfigDB, SchemaConfigDB, ScenarioStateDB, SensorEventDB
 
 # ==========================================================
-# HARDCODED SENSOR EVENTS (From sensorevents.txt)
-# ==========================================================
-# ==========================================================
 # SAFE ALERT ENGINE IMPORT
 # ==========================================================
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -151,6 +148,20 @@ def determine_priority(distance):
     if distance <= 3500: return "MEDIUM"
     return "LOW"
 
+def get_distance_bearing(lat1, lon1, lat2, lon2):
+    R = 6378137.0
+    lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
+    lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
+    dlon = lon2_rad - lon1_rad
+    dlat = lat2_rad - lat1_rad
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    dist = R * c
+    y = math.sin(dlon) * math.cos(lat2_rad)
+    x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon)
+    bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
+    return dist, bearing
+
 def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, device_alert_mapping):
     clean_type = str(device.type).upper()
     chosen_target_type = device_alert_mapping.get(device.id)
@@ -173,7 +184,6 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
     for field in pre_sorted_schema:
         fname = field.get('name', '').lower()
         
-        # [NEW] Intercept TargetType BEFORE staticValue is applied to securely override it
         if 'targettype' in fname and chosen_target_type is not None:
             packet.append(str(chosen_target_type))
             continue
@@ -214,41 +224,35 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
 # SPATIAL ENGINE WITH DYNAMIC PROBABILITIES
 # ==========================================================
 def build_spatial_indices(env_devices):
-    perimeters, buildings, vegetations, waterbodies, transport_lines = {}, {}, {}, {}, {}
-    groups = { "PERIMETER": {}, "BUILDING": {}, "VEGETATION": {}, "WATER": {}, "TRANSPORT": {} }
+    polygons = {}
+    lines = {}
 
     for env in env_devices:
-        cat = str(env.get("envCategory", "")).upper()
         poly_coords = env.get("polygon", [])
-        src_file = env.get("sourceFile", "Uploaded KML")
+        src_file = str(env.get("sourceFile", "Uploaded KML"))
+        cat = str(env.get("envCategory", "")).upper()
         if not poly_coords or len(poly_coords) < 2: continue
         
         shapely_coords = [(pt[1], pt[0]) for pt in poly_coords]
-        try:
-            if "PERIMETER" in cat and len(shapely_coords) >= 3:
-                groups["PERIMETER"].setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
-            elif "BUILDING" in cat and len(shapely_coords) >= 3:
-                groups["BUILDING"].setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
-            elif "VEGETATION" in cat and len(shapely_coords) >= 3:
-                groups["VEGETATION"].setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
-            elif "WATER" in cat and len(shapely_coords) >= 3:
-                groups["WATER"].setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
-            elif ("ROAD" in cat or "RAIL" in cat):
-                groups["TRANSPORT"].setdefault(src_file, []).append(ShapelyLineString(shapely_coords))
-        except Exception: continue
         
-    for f, items in groups["PERIMETER"].items(): perimeters[f] = unary_union(items)
-    for f, items in groups["BUILDING"].items(): buildings[f] = unary_union(items)
-    for f, items in groups["VEGETATION"].items(): vegetations[f] = unary_union(items)
-    for f, items in groups["WATER"].items(): waterbodies[f] = unary_union(items)
-    for f, items in groups["TRANSPORT"].items(): transport_lines[f] = unary_union(items)
+        is_perimeter = "PERIMETER" in src_file.upper() or "PERIMETER" in cat
 
-    return perimeters, buildings, vegetations, waterbodies, transport_lines
+        try:
+            if is_perimeter:
+                if shapely_coords[0] != shapely_coords[-1]:
+                    shapely_coords.append(shapely_coords[0])
+                lines.setdefault(src_file, []).append(ShapelyLineString(shapely_coords))
+            elif "ROAD" in cat or "RAIL" in cat or len(shapely_coords) == 2:
+                lines.setdefault(src_file, []).append(ShapelyLineString(shapely_coords))
+            elif len(shapely_coords) >= 3:
+                polygons.setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
+        except Exception: continue
 
-def sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions, kml_probs):
+    return polygons, lines
+
+def sample_spatial_point(d_obj, polygons, lines, target_assignment):
     clean_type = str(d_obj.type).upper()
     
-    # 1. PIDS Logic remains unchanged
     if "PIDS" in clean_type and d_obj.isPolygon and d_obj.polygon and len(d_obj.polygon) > 1:
         idx_poly = random.randint(0, len(d_obj.polygon) - 1)
         p1 = d_obj.polygon[idx_poly]; p2 = d_obj.polygon[(idx_poly + 1) % len(d_obj.polygon)]
@@ -260,66 +264,40 @@ def sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions
         dest_lat, dest_lng = fast_destination(edge_lat, edge_lng, offset_dist, offset_bearing)
         return round(dest_lat, 8), round(dest_lng, 8), round(offset_dist, 2), round(offset_bearing, 2), "HIGH"
 
-    # Fetch the General area probability from the UI (Default to 1.0 / 100% if not set)
-    general_prob = float(kml_probs.get("GENERAL", 1.0))
-
-    # Increase to 50 attempts for highly constrained maps
-    for attempt in range(50):
+    def get_random_point():
         dist = generate_uniform_distance(d_obj.innerRange, d_obj.outerRange)
         bearing = random.uniform(d_obj.azimuth - (d_obj.fov / 2), d_obj.azimuth + (d_obj.fov / 2)) % 360 if "CAM" in clean_type else random.uniform(0, 360)
-        
         cand_lat, cand_lng = fast_destination(d_obj.lat, d_obj.lng, dist, bearing)
-        cand_lat, cand_lng = round(cand_lat, 8), round(cand_lng, 8)
-        pt = ShapelyPoint(cand_lng, cand_lat)
+        return round(cand_lat, 8), round(cand_lng, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
 
-        # 2. PERIMETER CHECK (Fixed: Point must be inside AT LEAST ONE perimeter if they exist)
-        if p_unions:
-            is_inside_perimeter = False
-            for fname, poly in p_unions.items():
-                if poly.contains(pt):
-                    is_inside_perimeter = True
-                    break
-            if not is_inside_perimeter: continue
+    if target_assignment == "RANDOM":
+        return get_random_point()
+
+    try:
+        if target_assignment in polygons and polygons[target_assignment]:
+            poly = random.choice(polygons[target_assignment])
+            minx, miny, maxx, maxy = poly.bounds
+            for _ in range(50):
+                pnt = ShapelyPoint(random.uniform(minx, maxx), random.uniform(miny, maxy))
+                if poly.contains(pnt):
+                    dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
+                    return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+            
+            rep = poly.representative_point()
+            dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, rep.y, rep.x)
+            return round(rep.y, 8), round(rep.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+            
+        if target_assignment in lines and lines[target_assignment]:
+            line = random.choice(lines[target_assignment])
+            rand_dist = random.random() * line.length
+            pnt = line.interpolate(rand_dist)
+            dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
+            return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+            
+    except Exception:
+        pass
         
-        # 3. BUILDING CHECK (Fixed: Now looks up "BUILDING" correctly)
-        inside_building = False
-        for fname, poly in b_unions.items():
-            if poly.contains(pt):
-                prob = float(kml_probs.get("BUILDING", 0.0))
-                if random.random() > prob: 
-                    inside_building = True
-                break
-        if inside_building: continue
-
-        # 4. OTHER ZONES CHECK (Fixed: Now looks up categories correctly)
-        final_prob = general_prob
-        matched_feature = False
-        
-        for fname, line in t_unions.items():
-            if line.distance(pt) < 0.00018:
-                final_prob = float(kml_probs.get("TRANSPORT", 0.95))
-                matched_feature = True
-                break
-                
-        if not matched_feature:
-            for fname, poly in v_unions.items():
-                if poly.contains(pt):
-                    final_prob = float(kml_probs.get("VEGETATION", 0.85))
-                    matched_feature = True
-                    break
-        
-        if not matched_feature:
-            for fname, poly in w_unions.items():
-                if poly.contains(pt):
-                    final_prob = float(kml_probs.get("WATER", 0.08))
-                    break
-
-        # 5. FINAL PROBABILITY ROLL
-        if random.random() <= final_prob:
-            return cand_lat, cand_lng, round(dist, 2), round(bearing, 2), determine_priority(dist)
-
-    # 6. THE FIX: If it fails 50 times, return None so we don't spawn a fake point!
-    return None, None, None, None, None
+    return get_random_point()
 
 # ==========================================================
 # THE HIGH PERFORMANCE ENGINE WORKER
@@ -335,19 +313,40 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
     random.shuffle(pool)
     total = len(pool)
 
+    # --- ADD THESE 4 LINES TO NORMALIZE SUMS > 1.0 ---
+    if kml_probs:
+        total_prob_sum = sum(float(p) for p in kml_probs.values())
+        if total_prob_sum > 1.0:
+            kml_probs = {k: (float(v) / total_prob_sum) for k, v in kml_probs.items()}
+    # -------------------------------------------------
+
+    assignments = []
+    if kml_probs:
+        for fname, prob in kml_probs.items():
+            count = int(total * float(prob))
+            assignments.extend([fname] * count)
+            
+    if len(assignments) < total:
+        assignments.extend(["RANDOM"] * (total - len(assignments)))
+        
+    assignments = assignments[:total]
+    random.shuffle(assignments)
+    
+    assigned_pool = list(zip(pool, assignments))
+
     with engine_lock:
         engine_state['is_running'] = True
         engine_state['should_abort'] = False
         engine_state['progress'] = 0
         engine_state['total'] = total
-        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. UDP Engine Active with GIS Constraints.", "type": "info"}]
+        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. Quota Engine Active.", "type": "info"}]
         engine_state['map_alerts'] = []
 
     if total == 0:
         with engine_lock: engine_state['is_running'] = False
         return
 
-    p_unions, b_unions, v_unions, w_unions, t_unions = build_spatial_indices(env_devices)
+    polygons, lines = build_spatial_indices(env_devices)
     
     schema_cache = {}
     for s in schemas:
@@ -374,7 +373,6 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
 
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    # REMOVED DYNAMIC THROTTLING: Always log 1-to-1 to the Telemetry UI
     batch_step = 1 
     
     class DummyDev: pass
@@ -382,7 +380,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
     ui_alerts = deque(maxlen=1000)
     db_chunk = []
 
-    for idx, dev_dict in enumerate(pool):
+    for idx, (dev_dict, target_assignment) in enumerate(assigned_pool):
         with engine_lock:
             if engine_state['should_abort']:
                 engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": "SYSTEM: Transmission Aborted manually.", "type": "error"})
@@ -401,11 +399,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         d_obj.polygon = dev_dict.get('polygon', [])
         d_obj.packetChoice = dev_dict.get('packetChoice', '')
 
-        alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions, kml_probs)
-        if alert_lat is None:
-            if idx % batch_step == 0 or idx == total - 1:
-                with engine_lock: engine_state['progress'] = idx + 1
-            continue
+        alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, polygons, lines, target_assignment)
         track_id = idx + 1
         
         alert_data = {
@@ -421,7 +415,6 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         sel_schema = cache_entry['schema'] if cache_entry else None
         sel_sep = cache_entry['separator'] if cache_entry else ","
 
-        # Pass dynamic mappings into the packet builder!
         packet_string = build_dynamic_packet(alert_data, d_obj, track_id, sel_schema, sel_sep, device_alert_mapping)
         
         try: udp_socket.sendto(packet_string.encode('utf-8'), (str(udpIp), int(udpPort)))
@@ -462,33 +455,27 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
 # ==========================================================
 # FASTAPI ENDPOINTS
 # ==========================================================
-
-# Endpoint that serves the HARDCODED target selections to frontend
 @app.post("/api/engine/clear-alerts")
 def api_engine_clear_alerts():
     with engine_lock:
         engine_state["map_alerts"] = []
     return {"status": "success"}
+
 @app.get("/api/config/sensor-events")
 def get_sensor_events(db: Session = Depends(get_db)):
     events = db.query(SensorEventDB).all()
-    
-    # Group them dynamically so the frontend dropdowns work exactly as before
     grouped_events = {"CAMERA": [], "RADAR": [], "PIDS": []}
     for ev in events:
         stype = str(ev.sensor_type).upper()
         if stype not in grouped_events:
             grouped_events[stype] = []
         grouped_events[stype].append({"id": ev.event_id, "name": ev.name})
-        
     return grouped_events
 
 @app.post("/api/config/sensor-events")
 def save_sensor_events(payload: SensorEventUploadModel, db: Session = Depends(get_db)):
     try:
-        # Clear existing events so re-uploading a new file updates the list cleanly
         db.query(SensorEventDB).delete()
-        
         for field in payload.fields:
             new_event = SensorEventDB(
                 event_id=field.ID,
@@ -501,6 +488,7 @@ def save_sensor_events(payload: SensorEventUploadModel, db: Session = Depends(ge
         db.rollback()
         return {"status": "error", "message": str(e)}
     return {"status": "success"}
+
 @app.post("/api/engine/start")
 def api_engine_start(payload: dict):
     global engine_state
