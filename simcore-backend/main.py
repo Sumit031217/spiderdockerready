@@ -247,6 +247,8 @@ def build_spatial_indices(env_devices):
 
 def sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions, kml_probs):
     clean_type = str(d_obj.type).upper()
+    
+    # 1. PIDS Logic remains unchanged
     if "PIDS" in clean_type and d_obj.isPolygon and d_obj.polygon and len(d_obj.polygon) > 1:
         idx_poly = random.randint(0, len(d_obj.polygon) - 1)
         p1 = d_obj.polygon[idx_poly]; p2 = d_obj.polygon[(idx_poly + 1) % len(d_obj.polygon)]
@@ -258,7 +260,11 @@ def sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions
         dest_lat, dest_lng = fast_destination(edge_lat, edge_lng, offset_dist, offset_bearing)
         return round(dest_lat, 8), round(dest_lng, 8), round(offset_dist, 2), round(offset_bearing, 2), "HIGH"
 
-    for attempt in range(25):
+    # Fetch the General area probability from the UI (Default to 1.0 / 100% if not set)
+    general_prob = float(kml_probs.get("GENERAL", 1.0))
+
+    # Increase to 50 attempts for highly constrained maps
+    for attempt in range(50):
         dist = generate_uniform_distance(d_obj.innerRange, d_obj.outerRange)
         bearing = random.uniform(d_obj.azimuth - (d_obj.fov / 2), d_obj.azimuth + (d_obj.fov / 2)) % 360 if "CAM" in clean_type else random.uniform(0, 360)
         
@@ -266,48 +272,54 @@ def sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions
         cand_lat, cand_lng = round(cand_lat, 8), round(cand_lng, 8)
         pt = ShapelyPoint(cand_lng, cand_lat)
 
-        is_outside_perimeters = False
-        for fname, poly in p_unions.items():
-            if not poly.contains(pt):
-                is_outside_perimeters = True
-                break
-        if is_outside_perimeters: continue
+        # 2. PERIMETER CHECK (Fixed: Point must be inside AT LEAST ONE perimeter if they exist)
+        if p_unions:
+            is_inside_perimeter = False
+            for fname, poly in p_unions.items():
+                if poly.contains(pt):
+                    is_inside_perimeter = True
+                    break
+            if not is_inside_perimeter: continue
         
+        # 3. BUILDING CHECK (Fixed: Now looks up "BUILDING" correctly)
         inside_building = False
         for fname, poly in b_unions.items():
             if poly.contains(pt):
-                prob = kml_probs.get(fname, 0.0)
+                prob = float(kml_probs.get("BUILDING", 0.0))
                 if random.random() > prob: 
                     inside_building = True
-                    break
+                break
         if inside_building: continue
 
-        final_prob = 0.35 
+        # 4. OTHER ZONES CHECK (Fixed: Now looks up categories correctly)
+        final_prob = general_prob
         matched_feature = False
         
         for fname, line in t_unions.items():
             if line.distance(pt) < 0.00018:
-                final_prob = kml_probs.get(fname, 0.95)
+                final_prob = float(kml_probs.get("TRANSPORT", 0.95))
                 matched_feature = True
                 break
                 
         if not matched_feature:
             for fname, poly in v_unions.items():
                 if poly.contains(pt):
-                    final_prob = kml_probs.get(fname, 0.85)
+                    final_prob = float(kml_probs.get("VEGETATION", 0.85))
                     matched_feature = True
                     break
         
         if not matched_feature:
             for fname, poly in w_unions.items():
                 if poly.contains(pt):
-                    final_prob = kml_probs.get(fname, 0.08)
+                    final_prob = float(kml_probs.get("WATER", 0.08))
                     break
 
+        # 5. FINAL PROBABILITY ROLL
         if random.random() <= final_prob:
             return cand_lat, cand_lng, round(dist, 2), round(bearing, 2), determine_priority(dist)
 
-    return cand_lat, cand_lng, round(dist, 2), round(bearing, 2), determine_priority(dist)
+    # 6. THE FIX: If it fails 50 times, return None so we don't spawn a fake point!
+    return None, None, None, None, None
 
 # ==========================================================
 # THE HIGH PERFORMANCE ENGINE WORKER
@@ -390,6 +402,10 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         d_obj.packetChoice = dev_dict.get('packetChoice', '')
 
         alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, p_unions, b_unions, v_unions, w_unions, t_unions, kml_probs)
+        if alert_lat is None:
+            if idx % batch_step == 0 or idx == total - 1:
+                with engine_lock: engine_state['progress'] = idx + 1
+            continue
         track_id = idx + 1
         
         alert_data = {
