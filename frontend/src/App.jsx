@@ -15,9 +15,9 @@ import { MultiFileKMLParser } from './utils/kmlparser';
 const kmlParser = new MultiFileKMLParser();
 
 // ==========================================
-// GEOMETRY ENGINE 
+// GEOMETRY ENGINE (PHYSICS-BASED)
 // ==========================================
-const getCameraFovPolygon = (lat, lng, radiusMeters = 100, azimuth = 0, fov = 360) => {
+const getDirectionalFovPolygon = (lat, lng, radiusMeters = 100, azimuth = 0, fov = 360) => {
   if (lat == null || lng == null || isNaN(lat) || isNaN(lng)) return [];
   const R = 6371000;
   const centerLat = lat * (Math.PI / 180);
@@ -303,7 +303,7 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
             <p className="text-sm font-bold text-slate-300">Upload JSON Schema(s)</p>
           </div>
         </div>
-        {/* --- START OF THE CODE YOU JUST PASTED --- */}
+
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 shadow-sm flex flex-col relative overflow-hidden">
           <div className="absolute top-0 left-0 w-full h-1 bg-fuchsia-500"></div>
           <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-1 flex items-center"><Terminal className="w-4 h-4 mr-2 text-fuchsia-400"/> Global Sensor Events</h3>
@@ -314,7 +314,6 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
             <p className="text-sm font-bold text-slate-300">Upload Events (.JSON)</p>
           </div>
         </div>
-        {/* --- END OF THE CODE YOU JUST PASTED --- */}
 
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 shadow-sm flex flex-col relative overflow-hidden">
           <div className="absolute top-0 left-0 w-full h-1 bg-emerald-500"></div>
@@ -522,7 +521,6 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
     }));
   };
 
-  // --- NEW: Map Device ID to a selected TargetType ID ---
   const handleTargetChange = (deviceId, targetId) => {
     setScenario(prev => ({
         ...prev,
@@ -533,13 +531,14 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
     }));
   };
 
-  // Resolve which event list to show based on device type
   const getEventsForDevice = (type) => {
+    if (!sensorEvents) return [];
     const t = String(type).toUpperCase();
-    if (t.includes('RADAR')) return sensorEvents?.RADAR || [];
-    if (t.includes('CAM')) return sensorEvents?.CAMERA || [];
-    if (t.includes('PIDS')) return sensorEvents?.PIDS || [];
-    return [];
+    if (sensorEvents[t]) return sensorEvents[t];
+    const dynamicKey = Object.keys(sensorEvents).find(key => 
+      t.includes(key) || key.includes(t)
+    );
+    return dynamicKey ? sensorEvents[dynamicKey] : [];
   };
 
   const handleSave = async (e) => {
@@ -606,7 +605,6 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
           </div>
         </div>
 
-        {/* --- HARDWARE BINDING & EVENT OVERRIDE UI --- */}
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm">
           <div className="flex justify-between items-center border-b border-slate-800 pb-2 mb-4">
               <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider flex items-center">
@@ -647,7 +645,6 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                     <input type="checkbox" checked={isActive} readOnly className="w-4 h-4 accent-indigo-500" />
                   </div>
 
-                  {/* Dynamic Target Selection Dropdown (Only visible when activated) */}
                   {isActive && events.length > 0 && (
                       <div className="mt-3 pt-3 border-t border-slate-800/50 flex items-center justify-between" onClick={e => e.stopPropagation()}>
                           <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">Target Signature</span>
@@ -769,8 +766,7 @@ const AlertGeneratorView = ({
 // ==========================================
 // VIEW 4: TACTICAL MAP WITH LAYER CONTROL PANEL
 // ==========================================
-// Change this line:
-  const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAlertsGenerated, activeWorkspace, clearAlerts }) => {
+const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAlertsGenerated, activeWorkspace, clearAlerts }) => {
   const mapContainerRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showAll, setShowAll] = useState(false);
@@ -838,7 +834,6 @@ const AlertGeneratorView = ({
             </h2>
           </div>
           <div className="flex space-x-3">
-              {/* --- NEW BUTTON GOES HERE --- */}
               <button 
                   onClick={clearAlerts}
                   disabled={simIsRunning}
@@ -848,7 +843,6 @@ const AlertGeneratorView = ({
                   <Trash2 className="w-4 h-4 text-slate-400" />
                   <span className="text-xs font-mono text-slate-300 font-bold">CLEAR ALERTS</span>
               </button>
-              {/* ---------------------------- */}
               
               <div className="flex items-center space-x-2 bg-rose-950/40 border border-rose-900 rounded px-3 py-1">
                   <Target className="w-4 h-4 text-rose-500" />
@@ -928,7 +922,6 @@ const AlertGeneratorView = ({
 
         {isFullscreen && (
           <div className="absolute bottom-6 left-6 z-[1000] flex items-center space-x-3">
-             {/* --- NEW BUTTON GOES HERE --- */}
              <button 
                   onClick={clearAlerts}
                   disabled={simIsRunning}
@@ -937,7 +930,6 @@ const AlertGeneratorView = ({
                   <Trash2 className="w-5 h-5 text-slate-400" />
                   <span className="text-sm font-mono text-slate-300 font-bold">CLEAR ALERTS</span>
              </button>
-             {/* ---------------------------- */}
 
              <div className="flex items-center space-x-2 bg-rose-950/90 backdrop-blur border border-rose-900 rounded px-4 py-2 shadow-2xl">
                  <Target className="w-5 h-5 text-rose-500" />
@@ -952,14 +944,22 @@ const AlertGeneratorView = ({
           {visibleDevices.map((dev, idx) => {
             if (!dev || !dev.type) return null;
             const isEnv = dev.type.toUpperCase().includes('ENV');
-            const isCam = dev.type.toUpperCase().includes('CAM');
-            const isRadar = dev.type.toUpperCase().includes('RADAR');
+            const isPids = dev.type.toUpperCase().includes('PIDS');
+            
+            const fov = parseFloat(dev.fov || 360);
+            const outerRange = parseFloat(dev.outerRange || 100);
+            const innerRange = parseFloat(dev.innerRange || 0);
+            
+            const isDirectional = fov < 360;
+            const isMicroSensor = outerRange <= 2.0;
+
             const layerColor = dev.color || "#3b82f6";
             const safePoly = Array.isArray(dev.polygon) ? dev.polygon : [];
             const isLine = ['ROAD', 'RAILWAY'].includes(dev.envCategory);
             
             return (
               <React.Fragment key={dev.id || `dev-${idx}`}>
+                {/* ENVIRONMENTAL POLYGONS */}
                 {isEnv && dev.isPolygon && safePoly.length > 0 && (
                   isLine ? (
                     <LeafletPolyline positions={safePoly} pathOptions={{ color: layerColor, weight: 2.5 }}>
@@ -972,24 +972,48 @@ const AlertGeneratorView = ({
                   )
                 )}
                 
+                {/* ENVIRONMENTAL POINTS */}
                 {isEnv && !dev.isPolygon && dev.lat != null && dev.lng != null && (
                   <CircleMarker center={[dev.lat, dev.lng]} radius={4} pathOptions={{ color: '#ffffff', fillColor: layerColor, fillOpacity: 1, weight: 1.5 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup></CircleMarker>
                 )}
 
-                {dev.isPolygon && safePoly.length > 0 && !isEnv && (
+                {/* THE PIDS EXCEPTION (Perimeter Fences) */}
+                {isPids && dev.isPolygon && safePoly.length > 0 && !isEnv && (
                   <LeafletPolygon positions={safePoly} pathOptions={{ color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.3, weight: 3 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>PIDS Perimeter Array</Popup></LeafletPolygon>
                 )}
 
-                {!dev.isPolygon && isCam && dev.lat != null && dev.lng != null && (
-                  <LeafletPolygon positions={getCameraFovPolygon(dev.lat, dev.lng, dev.outerRange, dev.azimuth, dev.fov)} pathOptions={{ color: '#eab308', fillColor: '#eab308', fillOpacity: 0.25, weight: 1.5 }} />
+                {/* PHYSICS-BASED DIRECTIONAL (FOV < 360) */}
+                {!dev.isPolygon && !isEnv && isDirectional && !isMicroSensor && dev.lat != null && dev.lng != null && (
+                  <LeafletPolygon positions={getDirectionalFovPolygon(dev.lat, dev.lng, outerRange, dev.azimuth, fov)} pathOptions={{ color: '#eab308', fillColor: '#eab308', fillOpacity: 0.25, weight: 1.5 }} />
                 )}
 
-                {!dev.isPolygon && isRadar && dev.lat != null && dev.lng != null && (
-                  <><Circle center={[dev.lat, dev.lng]} radius={dev.outerRange || 100} pathOptions={{ color: '#ef4444', fillOpacity: 0.1, weight: 1.5, dashArray: "5, 5" }} /><Circle center={[dev.lat, dev.lng]} radius={dev.innerRange || 0} pathOptions={{ color: '#ef4444', fillOpacity: 0.0, weight: 2 }} /></>
-                )}
+                {/* PHYSICS-BASED OMNIDIRECTIONAL (FOV = 360) */}
+{!dev.isPolygon && !isEnv && !isDirectional && !isMicroSensor && dev.lat != null && dev.lng != null && (
+  <>
+    <Circle center={[dev.lat, dev.lng]} radius={outerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.1, weight: 1.5, dashArray: "5, 5" }} />
+    {innerRange > 0 && (
+      <Circle center={[dev.lat, dev.lng]} radius={innerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.0, weight: 2 }} />
+    )}
+  </>
+)}
 
+                {/* DYNAMIC SENSOR PIN */}
                 {!dev.isPolygon && !isEnv && dev.lat != null && dev.lng != null && (
-                  <CircleMarker center={[dev.lat, dev.lng]} radius={5} pathOptions={{ color: '#0f172a', fillColor: isRadar ? '#ef4444' : '#eab308', fillOpacity: 1, weight: 2 }}><Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{dev.id}</strong>Type: {dev.type}</Popup></CircleMarker>
+                  <CircleMarker 
+                      center={[dev.lat, dev.lng]} 
+                      radius={isMicroSensor ? 4 : 5} 
+                      pathOptions={{ 
+                          color: '#0f172a', 
+                          fillColor: isMicroSensor ? '#a855f7' : (isDirectional ? '#eab308' : '#ef4444'), 
+                          fillOpacity: 1, 
+                          weight: 2 
+                      }}
+                  >
+                      <Popup className="font-mono text-xs">
+                          <strong className="block text-sm mb-1">{dev.id}</strong>
+                          Type: {dev.type}
+                      </Popup>
+                  </CircleMarker>
                 )}
               </React.Fragment>
             );
@@ -1000,9 +1024,33 @@ const AlertGeneratorView = ({
              const lng = alert.longitude ?? (alert.loc ? alert.loc[1] : null);
              if (lat == null || lng == null) return null;
              
-             const type = String(alert.sensor_type || alert.type || 'UNKNOWN').toUpperCase();
-             const pinColor = type.includes('RADAR') ? '#dc2626' : type.includes('CAM') ? '#facc15' : '#22c55e';
-             return (<CircleMarker key={`alert-${alert.alert_id || alert.id || idx}`} center={[lat, lng]} radius={5} pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}><Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{type} ALERT</strong>Track ID: {alert.alert_id || alert.id || 'N/A'}</Popup></CircleMarker>);
+             // Cross-reference alert with parent device to inherit its physics color profile
+             const sourceDev = mapDevices.find(d => d.id === (alert.sensor_name || alert.id));
+             let pinColor = '#22c55e'; // Default Low Priority Green Fallback
+
+             if (sourceDev) {
+                 const outerRange = parseFloat(sourceDev.outerRange || 100);
+                 const fov = parseFloat(sourceDev.fov || 360);
+                 const isMicro = outerRange <= 2.0;
+                 const isDir = fov < 360;
+                 pinColor = isMicro ? '#a855f7' : (isDir ? '#facc15' : '#ef4444');
+             } else if (String(alert.sensor_type).toUpperCase().includes('PIDS')) {
+                 pinColor = '#facc15'; // Legacy PIDS fallback
+             }
+             
+             return (
+                 <CircleMarker 
+                     key={`alert-${alert.alert_id || alert.id || idx}`} 
+                     center={[lat, lng]} 
+                     radius={5} 
+                     pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}
+                 >
+                     <Popup className="font-mono text-xs">
+                         <strong className="block text-sm mb-1">{alert.sensor_type || 'UNKNOWN'} ALERT</strong>
+                         Track ID: {alert.alert_id || alert.id || 'N/A'}
+                     </Popup>
+                 </CircleMarker>
+             );
           })}
         </MapContainer>
       </div>
@@ -1208,7 +1256,6 @@ export default function App() {
   const [currentView, setCurrentView] = useState('Device Configuration');
   const [dbStatus, setDbStatus] = useState('Checking...');
   
-  // NEW: State for dynamically loaded sensor events
   const [sensorEvents, setSensorEvents] = useState({});
 
   const [sensorSchemas, setSensorSchemas] = useState([]); 
@@ -1256,7 +1303,6 @@ export default function App() {
   };
 
   useEffect(() => {
-    // NEW: Fetch Hardcoded Events from Backend
     fetch('/api/config/sensor-events')
       .then(res => res.json())
       .then(data => setSensorEvents(data))
@@ -1343,7 +1389,6 @@ export default function App() {
 
     const activeFleetWithOverrides = activeFleet.map(dev => ({ ...dev, alertCount: getAlertCount(dev) }));
     
-    // Explicitly pass both KML Probabilities AND Event Mapping into the engine
     const payload = {
         scenarioName: scenario?.name || 'Simulation',
         udpIp: scenario?.udpIp || '127.0.0.1',
@@ -1369,7 +1414,7 @@ export default function App() {
   const stopSimulation = () => {
     fetch('/api/engine/stop', { method: 'POST' });
   };
-  // --- PASTE THIS NEW FUNCTION RIGHT BELOW stopSimulation ---
+
   const handleSensorEventsUpload = async (event) => {
     const files = Array.from(event.target.files);
     if (!files.length) return;
@@ -1378,7 +1423,6 @@ export default function App() {
         const text = await files[0].text();
         const parsedData = JSON.parse(text);
         
-        // Validate structure matches SENSOR_EVENTS.json
         if (!parsedData.protocolName || !Array.isArray(parsedData.fields)) {
             throw new Error("Invalid format. Expected 'protocolName' and 'fields' array.");
         }
@@ -1391,7 +1435,6 @@ export default function App() {
 
         if (response.ok) {
             alert("✅ SUCCESS: Global Sensor Events saved to Database!");
-            // Instantly refresh the UI dropdowns
             const updatedEvents = await fetch('/api/config/sensor-events').then(res => res.json());
             setSensorEvents(updatedEvents);
         } else {
@@ -1402,12 +1445,10 @@ export default function App() {
         alert(`🚨 EVENT UPLOAD ERROR in ${files[0].name}!\n\nDetails: ${err.message}`); 
     }
   };
-  // --------------------------------------------------------
+
   const handleClearAlerts = async () => {
     if(window.confirm("Are you sure you want to clear all alerts from the map? This will not delete them from the database history.")) {
-        // Clear Frontend
         setActiveAlerts([]);
-        // Clear Backend Engine Memory
         try {
             await fetch('/api/engine/clear-alerts', { method: 'POST' });
         } catch (err) {

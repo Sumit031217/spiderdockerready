@@ -167,18 +167,16 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
     chosen_target_type = device_alert_mapping.get(device.id)
 
     if not pre_sorted_schema:
+        # Legacy hardcoded fallback if no schema is uploaded
         clean_id = str(device.id).replace("RADAR_", "").replace("CAM_", "").replace("PIDS_", "")
         if "PIDS" in clean_type:
             target_val = chosen_target_type if chosen_target_type is not None else 1112
             return ",".join(map(str, [clean_id, 25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, target_val, 0, 0, 0, 0, 0, track_id, 0]))
-        elif "CAM" in clean_type:
-            target_val = chosen_target_type if chosen_target_type is not None else "Intrusion"
-            return ",".join(map(str, [clean_id, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, target_val, 0, 0, 0]))
         else: 
             fov_start = (device.azimuth - (device.fov / 2)) % 360
             fov_end = (device.azimuth + (device.fov / 2)) % 360
             target_val = chosen_target_type if chosen_target_type is not None else 1
-            return ",".join(map(str, [clean_id, 9, round(device.lat, 6), round(device.lng, 6), 0, round(device.azimuth, 2), round(fov_start, 2), round(fov_end, 2), track_id, round(alert["latitude"], 8), round(alert["longitude"], 8), round(alert.get("distance_m", 0), 2), round(alert.get("bearing", 0), 2), 0, target_val, int(time.time()), 0, "", 0, 0, 0]))
+            return ",".join(map(str, [clean_id, 9, round(device.lat, 6), round(device.lng, 6), 0, round(device.azimuth, 2), round(fov_start, 2), round(fov_end, 2), track_id, round(alert["latitude"], 8), round(alert["longitude"], 8), round(alert.get("distance_m", 0), 2), round(alert.get("bearing", 0), 2), 0, target_val, int(time.time()), 0, "Event", 0, 0, 0]))
 
     packet = []
     for field in pre_sorted_schema:
@@ -195,8 +193,8 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
         dtype = field.get('dataType', '')
         val = 0 
         
-        if 'deviceid' in fname or 'sensorid' in fname: val = str(device.id).replace("RADAR_", "").replace("CAM_", "").replace("PIDS_", "")
-        elif 'devicetype' in fname or 'sensortype' in fname: val = 9 if "RADAR" in clean_type else 10 if "CAM" in clean_type else 11
+        if 'deviceid' in fname or 'sensorid' in fname: val = str(device.id)
+        elif 'devicetype' in fname or 'sensortype' in fname: val = 0 # Relies completely on Schema staticValue now
         elif 'devicelat' in fname or ('lat' in fname and 'target' not in fname): val = round(device.lat, 6)
         elif 'devicelong' in fname or 'devicelng' in fname or ('lon' in fname and 'target' not in fname): val = round(device.lng, 6)
         elif 'targetlat' in fname or 'alertlat' in fname: val = round(alert["latitude"], 8)
@@ -206,7 +204,7 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
         elif 'trackid' in fname or 'nodeid' in fname: val = track_id
         elif 'time' in fname or 'timestamp' in fname: val = int(time.time())
         elif 'targettype' in fname: val = 0 
-        elif 'otherinfo' in fname or 'analyticname' in fname: val = "Intrusion" if alert.get("priority") == 'HIGH' else "Motion"
+        elif 'otherinfo' in fname or 'analyticname' in fname: val = str(chosen_target_type) if chosen_target_type else "System Event"
         
         if dtype == 'Integer':
             try: val = int(float(val))
@@ -221,7 +219,7 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
     return separator.join(packet)
 
 # ==========================================================
-# SPATIAL ENGINE WITH DYNAMIC PROBABILITIES
+# SPATIAL ENGINE WITH DYNAMIC PROBABILITIES & PHYSICS VALIDATOR
 # ==========================================================
 def build_spatial_indices(env_devices):
     polygons = {}
@@ -234,7 +232,6 @@ def build_spatial_indices(env_devices):
         if not poly_coords or len(poly_coords) < 2: continue
         
         shapely_coords = [(pt[1], pt[0]) for pt in poly_coords]
-        
         is_perimeter = "PERIMETER" in src_file.upper() or "PERIMETER" in cat
 
         try:
@@ -253,6 +250,7 @@ def build_spatial_indices(env_devices):
 def sample_spatial_point(d_obj, polygons, lines, target_assignment):
     clean_type = str(d_obj.type).upper()
     
+    # 1. PIDS Geometry Topography Exception (Topological specific)
     if "PIDS" in clean_type and d_obj.isPolygon and d_obj.polygon and len(d_obj.polygon) > 1:
         idx_poly = random.randint(0, len(d_obj.polygon) - 1)
         p1 = d_obj.polygon[idx_poly]; p2 = d_obj.polygon[(idx_poly + 1) % len(d_obj.polygon)]
@@ -264,15 +262,30 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
         dest_lat, dest_lng = fast_destination(edge_lat, edge_lng, offset_dist, offset_bearing)
         return round(dest_lat, 8), round(dest_lng, 8), round(offset_dist, 2), round(offset_bearing, 2), "HIGH"
 
+    # 2. Universal Physics Constraint Evaluator
+    def is_valid_physics(dist, bearing):
+        if not (d_obj.innerRange <= dist <= d_obj.outerRange): 
+            return False
+        if d_obj.fov < 360:
+            start_b = (d_obj.azimuth - (d_obj.fov / 2)) % 360
+            end_b = (d_obj.azimuth + (d_obj.fov / 2)) % 360
+            if start_b <= end_b:
+                if not (start_b <= bearing <= end_b): return False
+            else:
+                if not (bearing >= start_b or bearing <= end_b): return False
+        return True
+
+    # 3. HELPER: Generate strictly compliant Random Point
     def get_random_point():
         dist = generate_uniform_distance(d_obj.innerRange, d_obj.outerRange)
-        bearing = random.uniform(d_obj.azimuth - (d_obj.fov / 2), d_obj.azimuth + (d_obj.fov / 2)) % 360 if "CAM" in clean_type else random.uniform(0, 360)
+        bearing = random.uniform(0, 360) if d_obj.fov >= 360 else random.uniform(d_obj.azimuth - (d_obj.fov / 2), d_obj.azimuth + (d_obj.fov / 2)) % 360
         cand_lat, cand_lng = fast_destination(d_obj.lat, d_obj.lng, dist, bearing)
         return round(cand_lat, 8), round(cand_lng, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
 
     if target_assignment == "RANDOM":
         return get_random_point()
 
+    # 4. SPATIAL TARGETING WITH STRICT PHYSICS PRIORITY
     try:
         if target_assignment in polygons and polygons[target_assignment]:
             poly = random.choice(polygons[target_assignment])
@@ -281,22 +294,28 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
                 pnt = ShapelyPoint(random.uniform(minx, maxx), random.uniform(miny, maxy))
                 if poly.contains(pnt):
                     dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
-                    return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+                    # PHYSICS-FIRST RULE: Only return if the polygon point is physically visible!
+                    if is_valid_physics(dist, bearing):
+                        return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
             
             rep = poly.representative_point()
             dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, rep.y, rep.x)
-            return round(rep.y, 8), round(rep.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
-            
+            if is_valid_physics(dist, bearing):
+                return round(rep.y, 8), round(rep.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+                
         if target_assignment in lines and lines[target_assignment]:
             line = random.choice(lines[target_assignment])
-            rand_dist = random.random() * line.length
-            pnt = line.interpolate(rand_dist)
-            dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
-            return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+            for _ in range(15):
+                rand_dist = random.random() * line.length
+                pnt = line.interpolate(rand_dist)
+                dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
+                if is_valid_physics(dist, bearing):
+                    return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
             
     except Exception:
         pass
         
+    # 5. PHYSICS FALLBACK: If the target polygon/line is physically out of range, fall back to hardware limits!
     return get_random_point()
 
 # ==========================================================
@@ -313,13 +332,13 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
     random.shuffle(pool)
     total = len(pool)
 
-    # --- ADD THESE 4 LINES TO NORMALIZE SUMS > 1.0 ---
+    # --- NORMALIZER FOR QUOTAS ---
     if kml_probs:
         total_prob_sum = sum(float(p) for p in kml_probs.values())
         if total_prob_sum > 1.0:
             kml_probs = {k: (float(v) / total_prob_sum) for k, v in kml_probs.items()}
-    # -------------------------------------------------
 
+    # --- THE QUOTA DEALER ---
     assignments = []
     if kml_probs:
         for fname, prob in kml_probs.items():
@@ -339,7 +358,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         engine_state['should_abort'] = False
         engine_state['progress'] = 0
         engine_state['total'] = total
-        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. Quota Engine Active.", "type": "info"}]
+        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. Physics Engine Active.", "type": "info"}]
         engine_state['map_alerts'] = []
 
     if total == 0:
@@ -372,11 +391,8 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
             engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB START ERROR: {str(e)}", "type": "error"})
 
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
     batch_step = 1 
-    
     class DummyDev: pass
-
     ui_alerts = deque(maxlen=1000)
     db_chunk = []
 
@@ -453,18 +469,17 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
 
 
 # ==========================================================
-# FASTAPI ENDPOINTS
+# FASTAPI ENDPOINTS & EXPORTERS
 # ==========================================================
 @app.post("/api/engine/clear-alerts")
 def api_engine_clear_alerts():
-    with engine_lock:
-        engine_state["map_alerts"] = []
+    with engine_lock: engine_state["map_alerts"] = []
     return {"status": "success"}
 
 @app.get("/api/config/sensor-events")
 def get_sensor_events(db: Session = Depends(get_db)):
     events = db.query(SensorEventDB).all()
-    grouped_events = {"CAMERA": [], "RADAR": [], "PIDS": []}
+    grouped_events = {}
     for ev in events:
         stype = str(ev.sensor_type).upper()
         if stype not in grouped_events:
@@ -477,11 +492,7 @@ def save_sensor_events(payload: SensorEventUploadModel, db: Session = Depends(ge
     try:
         db.query(SensorEventDB).delete()
         for field in payload.fields:
-            new_event = SensorEventDB(
-                event_id=field.ID,
-                name=field.Name,
-                sensor_type=field.Sensor_Type
-            )
+            new_event = SensorEventDB(event_id=field.ID, name=field.Name, sensor_type=field.Sensor_Type)
             db.add(new_event)
         db.commit()
     except Exception as e:
@@ -506,8 +517,7 @@ def api_engine_start(payload: dict):
             payload["scenarioName"], payload["udpIp"], payload["udpPort"],
             payload["activeDevices"], payload["environmentDevices"], payload["sensorSchemas"],
             payload["alertConfig"]["minDelaySec"], payload["alertConfig"]["maxDelaySec"],
-            payload.get("kmlProbabilities", {}),
-            payload.get("deviceAlertMapping", {})
+            payload.get("kmlProbabilities", {}), payload.get("deviceAlertMapping", {})
         ),
         daemon=True
     )
@@ -539,6 +549,7 @@ def get_active_alerts(db: Session = Depends(get_db)):
         } for a in alerts_query]
     return []
 
+# ZERO-HARDCODE GEOMETRY EXPORTER
 def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
     csv_io = StringIO()
     writer = csv.writer(csv_io)
@@ -546,7 +557,7 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
     for alert in alerts:
         writer.writerow([alert["sensor_type"], alert["sensor_name"], alert["alert_id"], alert["priority"], alert.get("latitude", 0), alert.get("longitude", 0), alert.get("distance_m", 0), alert.get("bearing", 0), alert["timestamp"]])
     
-    kml = f'<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n    <name>{report_name}</name>\n    <Style id="radarStyle"><IconStyle><color>ff0000ff</color><scale>1.4</scale></IconStyle></Style>\n    <Style id="cameraStyle"><IconStyle><color>ffff0000</color><scale>1.4</scale></IconStyle></Style>\n    <Style id="radarHighStyle"><IconStyle><color>ff0000ff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="radarMediumStyle"><IconStyle><color>ff00ffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="radarLowStyle"><IconStyle><color>ff00ff00</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="cameraHighStyle"><IconStyle><color>ffffffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="cameraMediumStyle"><IconStyle><color>ffffffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="cameraLowStyle"><IconStyle><color>ffffffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="pidsAlertStyle"><IconStyle><color>ffffff00</color><scale>1.3</scale></IconStyle></Style>\n'
+    kml = f'<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n    <name>{report_name}</name>\n    <Style id="omniStyle"><IconStyle><color>ff0000ff</color><scale>1.4</scale></IconStyle></Style>\n    <Style id="directionalStyle"><IconStyle><color>ffff0000</color><scale>1.4</scale></IconStyle></Style>\n    <Style id="alertHigh"><IconStyle><color>ff0000ff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="alertMedium"><IconStyle><color>ff00ffff</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="alertLow"><IconStyle><color>ff00ff00</color><scale>1.2</scale></IconStyle></Style>\n    <Style id="pidsAlertStyle"><IconStyle><color>ffffff00</color><scale>1.3</scale></IconStyle></Style>\n'
     
     for dev in devices:
         clean_type = str(dev.get("type", "")).upper()
@@ -554,6 +565,9 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
         lat = float(dev.get("lat", 0.0))
         lng = float(dev.get("lng", 0.0))
         polygon = dev.get("polygon", [])
+        fov = float(dev.get("fov", 360.0))
+        outerRange = float(dev.get("outerRange", 100.0))
+        innerRange = float(dev.get("innerRange", 0.0))
         
         if "ENV" in clean_type:
             hex_color = dev.get("color", "#888888").lstrip("#")
@@ -564,15 +578,20 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
                 if is_line: kml += f'<Placemark><name>{dev_id}</name><Style><LineStyle><color>{kml_color}</color><width>2.5</width></LineStyle></Style><LineString><coordinates>{coords_str}</coordinates></LineString></Placemark>'
                 else: kml += f'<Placemark><name>{dev_id}</name><Style><LineStyle><color>{kml_color}</color><width>2.5</width></LineStyle><PolyStyle><color>66{kml_color[2:]}</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>{coords_str}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
             else: kml += f'<Placemark><name>{dev_id}</name><Point><coordinates>{lng},{lat},0</coordinates></Point></Placemark>'
+            
         elif dev.get("isPolygon") and polygon:
             perimeter_coords = " ".join([f"{pt[1]},{pt[0]},0" for pt in polygon]) + f" {polygon[0][1]},{polygon[0][0]},0"
             kml += f'<Placemark><name>{dev_id} Boundary</name><Style><LineStyle><color>ff0000ff</color><width>3</width></LineStyle><PolyStyle><color>440000ff</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>{perimeter_coords}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
+            
         else:
-            style = "#radarStyle" if "RADAR" in clean_type else "#cameraStyle"
+            # GEOMETRY BASED STRICTLY ON FOV LIMITS, NOT SENSOR NAMES
+            style = "#directionalStyle" if fov < 360 else "#omniStyle"
             kml += f'<Placemark><name>{dev_id}</name><styleUrl>{style}</styleUrl><Point><coordinates>{lng},{lat},0</coordinates></Point></Placemark>'
-            if "CAM" in clean_type:
-                azimuth, fov, outerRange = float(dev.get("azimuth", 0.0)), float(dev.get("fov", 360.0)), float(dev.get("outerRange", 100.0))
-                start_bearing, end_bearing = (azimuth - (fov / 2)) % 360, (azimuth + (fov / 2)) % 360
+            
+            if fov < 360:
+                azimuth = float(dev.get("azimuth", 0.0))
+                start_bearing = (azimuth - (fov / 2)) % 360
+                end_bearing = (azimuth + (fov / 2)) % 360
                 arc_points = []
                 angle = start_bearing
                 while True:
@@ -581,21 +600,22 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
                     angle = (angle + 2) % 360
                     if abs((angle - end_bearing + 360) % 360) < 2: break
                 kml += f'<Placemark><name>{dev_id} FOV</name><Style><LineStyle><color>66ff0000</color><width>1</width></LineStyle><PolyStyle><color>2200ff00</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>{lng},{lat},0 {" ".join(arc_points)} {lng},{lat},0</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
-            elif "RADAR" in clean_type:
-                outerRange, innerRange = float(dev.get("outerRange", 100.0)), float(dev.get("innerRange", 0.0))
+            else:
                 outer_pts, inner_pts = [], []
                 for angle in range(361):
                     opt_lat, opt_lng = fast_destination(lat, lng, outerRange, angle)
-                    ipt_lat, ipt_lng = fast_destination(lat, lng, innerRange, angle)
                     outer_pts.append(f"{opt_lng},{opt_lat},0")
-                    inner_pts.append(f"{ipt_lng},{ipt_lat},0")
-                kml += f'<Placemark><name>{dev_id} Boundary</name><LineString><coordinates>{" ".join(outer_pts)}</coordinates></LineString></Placemark><Placemark><name>{dev_id} Exclusion</name><LineString><coordinates>{" ".join(inner_pts)}</coordinates></LineString></Placemark>'
+                    if innerRange > 0:
+                        ipt_lat, ipt_lng = fast_destination(lat, lng, innerRange, angle)
+                        inner_pts.append(f"{ipt_lng},{ipt_lat},0")
+                kml += f'<Placemark><name>{dev_id} Boundary</name><LineString><coordinates>{" ".join(outer_pts)}</coordinates></LineString></Placemark>'
+                if innerRange > 0:
+                    kml += f'<Placemark><name>{dev_id} Exclusion</name><LineString><coordinates>{" ".join(inner_pts)}</coordinates></LineString></Placemark>'
 
     for alert in alerts:
         clean_type = str(alert["sensor_type"]).upper()
-        if "RADAR" in clean_type: style = "#radarHighStyle" if alert["priority"] == "HIGH" else "#radarMediumStyle" if alert["priority"] == "MEDIUM" else "#radarLowStyle"
-        elif "PIDS" in clean_type: style = "#pidsAlertStyle"
-        else: style = "#cameraHighStyle" if alert["priority"] == "HIGH" else "#cameraMediumStyle" if alert["priority"] == "MEDIUM" else "#cameraLowStyle"
+        if "PIDS" in clean_type: style = "#pidsAlertStyle"
+        else: style = "#alertHigh" if alert["priority"] == "HIGH" else "#alertMedium" if alert["priority"] == "MEDIUM" else "#alertLow"
         kml += f'<Placemark><name>{alert["sensor_name"]}_{alert["alert_id"]}</name><description>Priority: {alert["priority"]}\nDistance: {alert.get("distance_m", 0)}m\nTimestamp: {alert["timestamp"]}</description><styleUrl>{style}</styleUrl><Point><coordinates>{alert.get("longitude",0)},{alert.get("latitude",0)},0</coordinates></Point></Placemark>'
     
     kml += "\n</Document>\n</kml>"
