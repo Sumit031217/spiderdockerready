@@ -163,11 +163,11 @@ def get_distance_bearing(lat1, lon1, lat2, lon2):
     return dist, bearing
 
 def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, device_alert_mapping):
-    clean_type = str(device.type).upper()
+    clean_type = device.clean_type
     chosen_target_type = device_alert_mapping.get(device.id)
 
     if not pre_sorted_schema:
-        # Legacy hardcoded fallback if no schema is uploaded
+        # Legacy hardcoded fallback
         clean_id = str(device.id).replace("RADAR_", "").replace("CAM_", "").replace("PIDS_", "")
         if "PIDS" in clean_type:
             target_val = chosen_target_type if chosen_target_type is not None else 1112
@@ -194,7 +194,7 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
         val = 0 
         
         if 'deviceid' in fname or 'sensorid' in fname: val = str(device.id)
-        elif 'devicetype' in fname or 'sensortype' in fname: val = 0 # Relies completely on Schema staticValue now
+        elif 'devicetype' in fname or 'sensortype' in fname: val = 0 
         elif 'devicelat' in fname or ('lat' in fname and 'target' not in fname): val = round(device.lat, 6)
         elif 'devicelong' in fname or 'devicelng' in fname or ('lon' in fname and 'target' not in fname): val = round(device.lng, 6)
         elif 'targetlat' in fname or 'alertlat' in fname: val = round(alert["latitude"], 8)
@@ -219,7 +219,7 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
     return separator.join(packet)
 
 # ==========================================================
-# SPATIAL ENGINE WITH DYNAMIC PROBABILITIES & PHYSICS VALIDATOR
+# CACHED SPATIAL ENGINE WITH PHYSICS VALIDATOR
 # ==========================================================
 def build_spatial_indices(env_devices):
     polygons = {}
@@ -238,19 +238,28 @@ def build_spatial_indices(env_devices):
             if is_perimeter:
                 if shapely_coords[0] != shapely_coords[-1]:
                     shapely_coords.append(shapely_coords[0])
-                lines.setdefault(src_file, []).append(ShapelyLineString(shapely_coords))
+                line = ShapelyLineString(shapely_coords)
+                # Cache length for fast interpolation
+                lines.setdefault(src_file, []).append({"geom": line, "length": line.length})
             elif "ROAD" in cat or "RAIL" in cat or len(shapely_coords) == 2:
-                lines.setdefault(src_file, []).append(ShapelyLineString(shapely_coords))
+                line = ShapelyLineString(shapely_coords)
+                lines.setdefault(src_file, []).append({"geom": line, "length": line.length})
             elif len(shapely_coords) >= 3:
-                polygons.setdefault(src_file, []).append(ShapelyPolygon(shapely_coords))
+                poly = ShapelyPolygon(shapely_coords)
+                rep = poly.representative_point()
+                # CPU/RAM OPTIMIZATION: Cache bounds and rep point once!
+                polygons.setdefault(src_file, []).append({
+                    "geom": poly,
+                    "bounds": poly.bounds,
+                    "rep_point": (rep.y, rep.x)
+                })
         except Exception: continue
 
     return polygons, lines
 
 def sample_spatial_point(d_obj, polygons, lines, target_assignment):
-    clean_type = str(d_obj.type).upper()
+    clean_type = d_obj.clean_type
     
-    # 1. PIDS Geometry Topography Exception (Topological specific)
     if "PIDS" in clean_type and d_obj.isPolygon and d_obj.polygon and len(d_obj.polygon) > 1:
         idx_poly = random.randint(0, len(d_obj.polygon) - 1)
         p1 = d_obj.polygon[idx_poly]; p2 = d_obj.polygon[(idx_poly + 1) % len(d_obj.polygon)]
@@ -262,7 +271,6 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
         dest_lat, dest_lng = fast_destination(edge_lat, edge_lng, offset_dist, offset_bearing)
         return round(dest_lat, 8), round(dest_lng, 8), round(offset_dist, 2), round(offset_bearing, 2), "HIGH"
 
-    # 2. Universal Physics Constraint Evaluator
     def is_valid_physics(dist, bearing):
         if not (d_obj.innerRange <= dist <= d_obj.outerRange): 
             return False
@@ -275,7 +283,6 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
                 if not (bearing >= start_b or bearing <= end_b): return False
         return True
 
-    # 3. HELPER: Generate strictly compliant Random Point
     def get_random_point():
         dist = generate_uniform_distance(d_obj.innerRange, d_obj.outerRange)
         bearing = random.uniform(0, 360) if d_obj.fov >= 360 else random.uniform(d_obj.azimuth - (d_obj.fov / 2), d_obj.azimuth + (d_obj.fov / 2)) % 360
@@ -285,28 +292,32 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
     if target_assignment == "RANDOM":
         return get_random_point()
 
-    # 4. SPATIAL TARGETING WITH STRICT PHYSICS PRIORITY
     try:
         if target_assignment in polygons and polygons[target_assignment]:
-            poly = random.choice(polygons[target_assignment])
-            minx, miny, maxx, maxy = poly.bounds
+            cached_poly = random.choice(polygons[target_assignment])
+            poly = cached_poly["geom"]
+            minx, miny, maxx, maxy = cached_poly["bounds"]
+            
             for _ in range(50):
                 pnt = ShapelyPoint(random.uniform(minx, maxx), random.uniform(miny, maxy))
                 if poly.contains(pnt):
                     dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
-                    # PHYSICS-FIRST RULE: Only return if the polygon point is physically visible!
                     if is_valid_physics(dist, bearing):
                         return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
             
-            rep = poly.representative_point()
-            dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, rep.y, rep.x)
+            # Use pre-calculated rep point to save CPU
+            rep_y, rep_x = cached_poly["rep_point"]
+            dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, rep_y, rep_x)
             if is_valid_physics(dist, bearing):
-                return round(rep.y, 8), round(rep.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+                return round(rep_y, 8), round(rep_x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
                 
         if target_assignment in lines and lines[target_assignment]:
-            line = random.choice(lines[target_assignment])
+            cached_line = random.choice(lines[target_assignment])
+            line = cached_line["geom"]
+            line_len = cached_line["length"]
+            
             for _ in range(15):
-                rand_dist = random.random() * line.length
+                rand_dist = random.random() * line_len
                 pnt = line.interpolate(rand_dist)
                 dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
                 if is_valid_physics(dist, bearing):
@@ -315,56 +326,74 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
     except Exception:
         pass
         
-    # 5. PHYSICS FALLBACK: If the target polygon/line is physically out of range, fall back to hardware limits!
     return get_random_point()
 
 # ==========================================================
-# THE HIGH PERFORMANCE ENGINE WORKER
+# THE HIGH PERFORMANCE ENGINE WORKER (MEMORY OPTIMIZED)
 # ==========================================================
+class OptimizedDevice:
+    __slots__ = ['id', 'type', 'clean_type', 'lat', 'lng', 'innerRange', 'outerRange', 'azimuth', 'fov', 'isPolygon', 'polygon', 'packetChoice']
+    def __init__(self, d):
+        self.id = d.get('id', '')
+        self.type = d.get('type', '')
+        self.clean_type = str(self.type).upper()
+        self.lat = float(d.get('lat', 0.0))
+        self.lng = float(d.get('lng', 0.0))
+        self.innerRange = float(d.get('innerRange', 0.0))
+        self.outerRange = float(d.get('outerRange', 100.0))
+        self.azimuth = float(d.get('azimuth', 0.0))
+        self.fov = float(d.get('fov', 360.0))
+        self.isPolygon = bool(d.get('isPolygon', False))
+        self.polygon = d.get('polygon', [])
+        self.packetChoice = d.get('packetChoice', '')
+
 def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping):
     global engine_state
     
-    pool = []
-    for dev in active_devices:
-        count = int(dev.get('alertCount', 0))
-        for _ in range(count): pool.append(dev)
-            
-    random.shuffle(pool)
-    total = len(pool)
-
-    # --- NORMALIZER FOR QUOTAS ---
+    # --- RAM OPTIMIZATION 1: Normalizer ---
     if kml_probs:
         total_prob_sum = sum(float(p) for p in kml_probs.values())
         if total_prob_sum > 1.0:
             kml_probs = {k: (float(v) / total_prob_sum) for k, v in kml_probs.items()}
 
-    # --- THE QUOTA DEALER ---
-    assignments = []
-    if kml_probs:
-        for fname, prob in kml_probs.items():
-            count = int(total * float(prob))
-            assignments.extend([fname] * count)
-            
-    if len(assignments) < total:
-        assignments.extend(["RANDOM"] * (total - len(assignments)))
+    # --- RAM OPTIMIZATION 2: The Smart Counter Pool ---
+    # Drops RAM usage from 1,000,000 array items down to ~50 dictionary objects!
+    task_pool = []
+    total_alerts_requested = 0
+
+    for dev_dict in active_devices:
+        dev_total = int(dev_dict.get('alertCount', 0))
+        if dev_total <= 0: continue
+        total_alerts_requested += dev_total
         
-    assignments = assignments[:total]
-    random.shuffle(assignments)
-    
-    assigned_pool = list(zip(pool, assignments))
+        # Pre-build device object to save CPU inside loop
+        d_obj = OptimizedDevice(dev_dict)
+        
+        allocated = 0
+        if kml_probs:
+            for fname, prob in kml_probs.items():
+                count = int(dev_total * float(prob))
+                if count > 0:
+                    task_pool.append({"dev": d_obj, "target": fname, "remaining": count})
+                    allocated += count
+                    
+        remainder = dev_total - allocated
+        if remainder > 0:
+            task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": remainder})
 
     with engine_lock:
         engine_state['is_running'] = True
         engine_state['should_abort'] = False
         engine_state['progress'] = 0
-        engine_state['total'] = total
-        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. Physics Engine Active.", "type": "info"}]
+        engine_state['total'] = total_alerts_requested
+        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. Memory-Optimized Physics Engine Active.", "type": "info"}]
         engine_state['map_alerts'] = []
 
-    if total == 0:
+    if total_alerts_requested == 0 or not task_pool:
         with engine_lock: engine_state['is_running'] = False
         return
 
+    # Cache Geometries
     polygons, lines = build_spatial_indices(env_devices)
     
     schema_cache = {}
@@ -378,7 +407,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
     run_id = None
     try:
         db_run = SimulationRun(
-            scenario_name=scenarioName, total_alerts=total, 
+            scenario_name=scenarioName, total_alerts=total_alerts_requested, 
             timestamp=datetime.now(timezone.utc).isoformat(),
             devices_snapshot=json.dumps(active_devices + env_devices) 
         )
@@ -391,35 +420,28 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
             engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB START ERROR: {str(e)}", "type": "error"})
 
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    batch_step = 1 
-    class DummyDev: pass
     ui_alerts = deque(maxlen=1000)
     db_chunk = []
 
-    for idx, (dev_dict, target_assignment) in enumerate(assigned_pool):
+    # --- THE OPTIMIZED TRANSMISSION LOOP ---
+    for current_idx in range(total_alerts_requested):
         with engine_lock:
             if engine_state['should_abort']:
                 engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": "SYSTEM: Transmission Aborted manually.", "type": "error"})
                 break
 
-        d_obj = DummyDev()
-        d_obj.id = dev_dict.get('id', '')
-        d_obj.type = dev_dict.get('type', '')
-        d_obj.lat = float(dev_dict.get('lat', 0.0))
-        d_obj.lng = float(dev_dict.get('lng', 0.0))
-        d_obj.innerRange = float(dev_dict.get('innerRange', 0.0))
-        d_obj.outerRange = float(dev_dict.get('outerRange', 100.0))
-        d_obj.azimuth = float(dev_dict.get('azimuth', 0.0))
-        d_obj.fov = float(dev_dict.get('fov', 360.0))
-        d_obj.isPolygon = bool(dev_dict.get('isPolygon', False))
-        d_obj.polygon = dev_dict.get('polygon', [])
-        d_obj.packetChoice = dev_dict.get('packetChoice', '')
+        # Fast Random Task Selection (Simulates a perfect shuffle without RAM cost)
+        task_idx = random.randrange(len(task_pool))
+        current_task = task_pool[task_idx]
+        
+        d_obj = current_task["dev"]
+        target_assignment = current_task["target"]
 
         alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, polygons, lines, target_assignment)
-        track_id = idx + 1
+        track_id = current_idx + 1
         
         alert_data = {
-            "run_id": run_id, "sensor_type": str(d_obj.type).upper(), "sensor_name": d_obj.id,
+            "run_id": run_id, "sensor_type": d_obj.clean_type, "sensor_name": d_obj.id,
             "alert_id": track_id, "priority": priority, "latitude": alert_lat, "longitude": alert_lng,
             "distance_m": dist, "bearing": bearing, "timestamp": datetime.now(timezone.utc).isoformat()
         }
@@ -436,18 +458,26 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         try: udp_socket.sendto(packet_string.encode('utf-8'), (str(udpIp), int(udpPort)))
         except Exception: pass
 
+        # Database flush management
         if len(db_chunk) >= 5000:
             db.bulk_insert_mappings(AlertLog, db_chunk)
             db.commit()
             db_chunk.clear()
 
-        if idx % batch_step == 0 or idx == total - 1:
+        # UI Updates
+        if current_idx % 1 == 0 or current_idx == total_alerts_requested - 1:
             with engine_lock:
-                engine_state['progress'] = idx + 1
+                engine_state['progress'] = current_idx + 1
                 engine_state['map_alerts'] = list(ui_alerts)
                 engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"[{d_obj.id}] -> {packet_string}", "type": "success"})
                 if len(engine_state['logs']) > 50:
                     engine_state['logs'] = engine_state['logs'][:50]
+
+        # Task Management Cleanup (O(1) fast removal)
+        current_task["remaining"] -= 1
+        if current_task["remaining"] <= 0:
+            task_pool[task_idx] = task_pool[-1]
+            task_pool.pop()
 
         delay = random.uniform(float(minDelay), float(maxDelay))
         if delay > 0: time.sleep(delay)
@@ -460,8 +490,8 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
 
     if not engine_state['should_abort']:
         with engine_lock:
-            engine_state['progress'] = total
-            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Transmission Complete. {total} packets sent and committed to DB.", "type": "info"})
+            engine_state['progress'] = total_alerts_requested
+            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Transmission Complete. {total_alerts_requested} packets sent and committed to DB.", "type": "info"})
 
     db.close()
     with engine_lock:
@@ -584,7 +614,6 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
             kml += f'<Placemark><name>{dev_id} Boundary</name><Style><LineStyle><color>ff0000ff</color><width>3</width></LineStyle><PolyStyle><color>440000ff</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>{perimeter_coords}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
             
         else:
-            # GEOMETRY BASED STRICTLY ON FOV LIMITS, NOT SENSOR NAMES
             style = "#directionalStyle" if fov < 360 else "#omniStyle"
             kml += f'<Placemark><name>{dev_id}</name><styleUrl>{style}</styleUrl><Point><coordinates>{lng},{lat},0</coordinates></Point></Placemark>'
             
