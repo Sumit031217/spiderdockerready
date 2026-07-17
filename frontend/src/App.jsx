@@ -35,14 +35,138 @@ const getDirectionalFovPolygon = (lat, lng, radiusMeters = 100, azimuth = 0, fov
   return points.length > 0 ? points : [];
 };
 
-const parseKmlColor = (kmlHex) => {
-  if (!kmlHex || String(kmlHex).length !== 8) return null;
-  const hexStr = String(kmlHex);
-  const rr = hexStr.substring(6, 8);
-  const gg = hexStr.substring(4, 6);
-  const bb = hexStr.substring(2, 4);
-  return `#${rr}${gg}${bb}`;
-};
+// ==========================================
+// OPTIMIZATION: MEMOIZED MAP LAYERS
+// Protects the Canvas from destroying and redrawing heavy GIS data every 500ms
+// ==========================================
+const StaticEnvironmentLayer = React.memo(({ visibleDevices }) => {
+  return (
+    <>
+      {visibleDevices.map((dev, idx) => {
+        if (!dev || !dev.type) return null;
+        const isEnv = dev.type.toUpperCase().includes('ENV');
+        const isPids = dev.type.toUpperCase().includes('PIDS');
+        
+        const fov = parseFloat(dev.fov || 360);
+        const outerRange = parseFloat(dev.outerRange || 100);
+        const innerRange = parseFloat(dev.innerRange || 0);
+        
+        const isDirectional = fov < 360;
+        const isMicroSensor = outerRange <= 2.0;
+
+        const layerColor = dev.color || "#3b82f6";
+        const safePoly = Array.isArray(dev.polygon) ? dev.polygon : [];
+        const isLine = ['ROAD', 'RAILWAY'].includes(dev.envCategory);
+        
+        return (
+          <React.Fragment key={dev.id || `dev-${idx}`}>
+            {/* ENVIRONMENTAL POLYGONS */}
+            {isEnv && dev.isPolygon && safePoly.length > 0 && (
+              isLine ? (
+                <LeafletPolyline positions={safePoly} pathOptions={{ color: layerColor, weight: 2.5 }}>
+                  <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
+                </LeafletPolyline>
+              ) : (
+                <LeafletPolygon positions={safePoly} pathOptions={{ color: layerColor, fillColor: layerColor, fillOpacity: dev.envCategory === 'BUILDING' ? 0.55 : 0.35, weight: dev.envCategory === 'PERIMETER' ? 3.5 : 1.5 }}>
+                  <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
+                </LeafletPolygon>
+              )
+            )}
+            
+            {/* ENVIRONMENTAL POINTS */}
+            {isEnv && !dev.isPolygon && dev.lat != null && dev.lng != null && (
+              <CircleMarker center={[dev.lat, dev.lng]} radius={4} pathOptions={{ color: '#ffffff', fillColor: layerColor, fillOpacity: 1, weight: 1.5 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup></CircleMarker>
+            )}
+
+            {/* THE PIDS EXCEPTION (Perimeter Fences) */}
+            {isPids && dev.isPolygon && safePoly.length > 0 && !isEnv && (
+              <LeafletPolygon positions={safePoly} pathOptions={{ color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.3, weight: 3 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>PIDS Perimeter Array</Popup></LeafletPolygon>
+            )}
+
+            {/* PHYSICS-BASED DIRECTIONAL (FOV < 360) */}
+            {!dev.isPolygon && !isEnv && isDirectional && !isMicroSensor && dev.lat != null && dev.lng != null && (
+              <LeafletPolygon positions={getDirectionalFovPolygon(dev.lat, dev.lng, outerRange, dev.azimuth, fov)} pathOptions={{ color: '#eab308', fillColor: '#eab308', fillOpacity: 0.25, weight: 1.5 }} />
+            )}
+
+            {/* PHYSICS-BASED OMNIDIRECTIONAL (FOV = 360) */}
+            {!dev.isPolygon && !isEnv && !isDirectional && !isMicroSensor && dev.lat != null && dev.lng != null && (
+              <>
+                <Circle center={[dev.lat, dev.lng]} radius={outerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.1, weight: 1.5, dashArray: "5, 5" }} />
+                {innerRange > 0 && (
+                  <Circle center={[dev.lat, dev.lng]} radius={innerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.0, weight: 2 }} />
+                )}
+              </>
+            )}
+
+            {/* DYNAMIC SENSOR PIN */}
+            {!dev.isPolygon && !isEnv && dev.lat != null && dev.lng != null && (
+              <CircleMarker 
+                  center={[dev.lat, dev.lng]} 
+                  radius={isMicroSensor ? 4 : 5} 
+                  pathOptions={{ 
+                      color: '#0f172a', 
+                      fillColor: isMicroSensor ? '#a855f7' : (isDirectional ? '#eab308' : '#ef4444'), 
+                      fillOpacity: 1, 
+                      weight: 2 
+                  }}
+              >
+                  <Popup className="font-mono text-xs">
+                      <strong className="block text-sm mb-1">{dev.id}</strong>
+                      Type: {dev.type}
+                  </Popup>
+              </CircleMarker>
+            )}
+          </React.Fragment>
+        );
+      })}
+    </>
+  );
+});
+
+// OPTIMIZATION: Memoized Live Alerts Layer with O(1) Hash Map Color Lookup
+const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices }) => {
+  // Pre-compute colors so we don't run an array search 1000 times every half second
+  const colorMap = useMemo(() => {
+    const cmap = {};
+    mapDevices.forEach(d => {
+       const outerRange = parseFloat(d.outerRange || 100);
+       const fov = parseFloat(d.fov || 360);
+       const isMicro = outerRange <= 2.0;
+       const isDir = fov < 360;
+       cmap[d.id] = isMicro ? '#a855f7' : (isDir ? '#facc15' : '#ef4444');
+    });
+    return cmap;
+  }, [mapDevices]);
+
+  return (
+    <>
+      {displayedAlerts.map((alert, idx) => {
+         const lat = alert.latitude ?? (alert.loc ? alert.loc[0] : null);
+         const lng = alert.longitude ?? (alert.loc ? alert.loc[1] : null);
+         if (lat == null || lng == null) return null;
+         
+         let pinColor = colorMap[alert.sensor_name || alert.id] || '#22c55e';
+         if (!colorMap[alert.sensor_name || alert.id] && String(alert.sensor_type).toUpperCase().includes('PIDS')) {
+             pinColor = '#facc15';
+         }
+         
+         return (
+             <CircleMarker 
+                 key={`alert-${alert.alert_id || alert.id || idx}`} 
+                 center={[lat, lng]} 
+                 radius={5} 
+                 pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}
+             >
+                 <Popup className="font-mono text-xs">
+                     <strong className="block text-sm mb-1">{alert.sensor_type || 'UNKNOWN'} ALERT</strong>
+                     Track ID: {alert.alert_id || alert.id || 'N/A'}
+                 </Popup>
+             </CircleMarker>
+         );
+      })}
+    </>
+  );
+});
 
 // ==========================================
 // MODULE 1: DEVICE CONFIGURATION
@@ -266,7 +390,47 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
     setSensorSchemas((Array.isArray(sensorSchemas) ? sensorSchemas : []).filter(s => s.name !== name));
     fetch(`/api/config/schemas/${name}`, { method: 'DELETE' }).catch(() => {});
   };
+  // --- NEW BULK DELETE HANDLERS ---
+  const handleDeleteAllSensors = async () => {
+    if (!window.confirm(`Delete ALL hardware sensors in workspace '${activeWorkspace}'?`)) return;
+    const idsToDelete = hardwareSensors.map(d => d.id);
+    setDevices(prev => prev.filter(d => !idsToDelete.includes(d.id)));
+    if (idsToDelete.length > 0) {
+      fetch('/api/config/devices/delete_batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: idsToDelete }) }).catch(()=>{});
+    }
+  };
 
+  const handleDeleteAllKml = async () => {
+    if (!window.confirm(`Delete ALL KML layers in workspace '${activeWorkspace}'?`)) return;
+    const idsToDelete = environmentFeatures.map(d => d.id);
+    setDevices(prev => prev.filter(d => !idsToDelete.includes(d.id)));
+    if (idsToDelete.length > 0) {
+      fetch('/api/config/devices/delete_batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: idsToDelete }) }).catch(()=>{});
+    }
+  };
+
+  const handleDeleteAllSchemas = () => {
+    if (!window.confirm(`Delete ALL Global Packet Formats?`)) return;
+    (Array.isArray(sensorSchemas) ? sensorSchemas : []).forEach(s => {
+      fetch(`/api/config/schemas/${s.name}`, { method: 'DELETE' }).catch(()=>{});
+    });
+    setSensorSchemas([]);
+  };
+
+  const handleDeleteWorkspace = async () => {
+    if (activeWorkspace === 'Default') return alert("You cannot delete the 'Default' workspace, but you can clear its contents.");
+    if (!window.confirm(`WARNING: Permanently delete the workspace '${activeWorkspace}' AND all its sensors/KMLs?`)) return;
+    
+    const idsToDelete = safeDevices.filter(d => (d.workspace || 'Default') === activeWorkspace).map(d => d.id);
+    setDevices(prev => prev.filter(d => !idsToDelete.includes(d.id)));
+    setCustomWorkspaces(prev => prev.filter(ws => ws !== activeWorkspace));
+    setActiveWorkspace('Default');
+    
+    if (idsToDelete.length > 0) {
+      fetch('/api/config/devices/delete_batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: idsToDelete }) }).catch(()=>{});
+    }
+  };
+  // --------------------------------
   return (
     <div className="p-6 max-w-[1600px] mx-auto space-y-6">
       <div className="flex items-center justify-between border-b border-slate-800 pb-4">
@@ -288,6 +452,11 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
           <div className="flex items-center space-x-2 bg-slate-950 p-2 rounded border border-slate-800">
               <input type="text" value={newWorkspaceName} onChange={e => setNewWorkspaceName(e.target.value)} placeholder="New Workspace Name..." className="bg-transparent px-2 py-1 text-sm text-slate-200 outline-none w-48" />
               <button onClick={handleCreateWorkspace} className="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold py-1.5 px-4 rounded text-xs transition-colors cursor-pointer">CREATE & SELECT</button>
+              {activeWorkspace !== 'Default' && (
+                  <button onClick={handleDeleteWorkspace} className="bg-rose-950 hover:bg-rose-900 text-rose-400 font-bold py-1.5 px-3 rounded text-xs transition-colors cursor-pointer ml-2 border border-rose-900/50" title="Delete Workspace">
+                      <Trash2 className="w-4 h-4" />
+                  </button>
+              )}
           </div>
       </div>
 
@@ -341,10 +510,13 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 mt-6">
         <div className="xl:col-span-2 bg-slate-900 border border-slate-800 rounded-lg flex flex-col overflow-hidden shadow-sm h-[380px]">
-          <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex justify-between items-center">
-            <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center"><Server className="w-4 h-4 mr-2 text-indigo-400"/> Deployed Sensors ({hardwareSensors.length})</h3>
-            <button onClick={syncDevicesToDB} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 px-4 rounded text-xs flex items-center shadow-lg cursor-pointer"><Save className="w-4 h-4 mr-2" /> SAVE SENSORS TO DB</button>
-          </div>
+            <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex justify-between items-center">
+              <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center"><Server className="w-4 h-4 mr-2 text-indigo-400"/> Deployed Sensors ({hardwareSensors.length})</h3>
+              <div className="flex space-x-2">
+                  <button onClick={handleDeleteAllSensors} className="bg-rose-950/50 hover:bg-rose-900 border border-rose-900 text-rose-400 font-bold py-1.5 px-3 rounded text-xs flex items-center transition-colors cursor-pointer"><Trash2 className="w-3.5 h-3.5 mr-1" /> DELETE ALL</button>
+                  <button onClick={syncDevicesToDB} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 px-4 rounded text-xs flex items-center shadow-lg cursor-pointer"><Save className="w-4 h-4 mr-2" /> SAVE TO DB</button>
+              </div>
+            </div>
           <div className="flex-1 overflow-auto p-0">
             {hardwareSensors.length === 0 ? <div className="h-full flex flex-col items-center justify-center text-slate-600 font-mono text-sm">No hardware sensors loaded in this workspace.</div> : (
               <table className="w-full text-left text-sm whitespace-nowrap">
@@ -375,10 +547,13 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
         </div>
 
         <div className="bg-slate-900 border border-slate-800 rounded-lg flex flex-col overflow-hidden shadow-sm h-[380px]">
-          <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex justify-between items-center">
-            <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center"><Settings className="w-4 h-4 mr-2 text-fuchsia-400"/> Packet Formats ({(Array.isArray(sensorSchemas) ? sensorSchemas : []).length})</h3>
-            <button onClick={syncSchemasToDB} className="bg-fuchsia-600 hover:bg-fuchsia-500 text-white font-bold py-1.5 px-4 rounded text-xs flex items-center shadow-lg cursor-pointer"><Save className="w-4 h-4 mr-2" /> SAVE FORMATS</button>
-          </div>
+            <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex justify-between items-center">
+              <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center"><Settings className="w-4 h-4 mr-2 text-fuchsia-400"/> Packet Formats ({(Array.isArray(sensorSchemas) ? sensorSchemas : []).length})</h3>
+              <div className="flex space-x-2">
+                  <button onClick={handleDeleteAllSchemas} className="bg-rose-950/50 hover:bg-rose-900 border border-rose-900 text-rose-400 font-bold py-1.5 px-3 rounded text-xs flex items-center transition-colors cursor-pointer"><Trash2 className="w-3.5 h-3.5 mr-1" /> DELETE ALL</button>
+                  <button onClick={syncSchemasToDB} className="bg-fuchsia-600 hover:bg-fuchsia-500 text-white font-bold py-1.5 px-4 rounded text-xs flex items-center shadow-lg cursor-pointer"><Save className="w-4 h-4 mr-2" /> SAVE</button>
+              </div>
+            </div>
           <div className="flex-1 overflow-auto">
             {(!sensorSchemas || sensorSchemas.length === 0) ? <div className="p-10 text-center text-slate-500 font-mono text-xs">No schemas loaded.</div> : (
               <table className="w-full text-left text-xs whitespace-nowrap">
@@ -398,16 +573,17 @@ const DeviceConfigView = ({ devices, setDevices, sensorSchemas, setSensorSchemas
       </div>
 
       <div className="bg-slate-900 border border-slate-800 rounded-lg flex flex-col overflow-hidden shadow-sm h-[360px] mt-6">
-        <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex justify-between items-center">
-          <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center">
-            <Layers className="w-4 h-4 mr-2 text-emerald-400"/> Workspace KML Files ({fileGroups.length})
-          </h3>
-          <div className="flex items-center space-x-3">
-            <button onClick={syncDevicesToDB} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 px-4 rounded text-xs flex items-center shadow-lg cursor-pointer">
-              <Save className="w-4 h-4 mr-2" /> SAVE GIS TO DB
-            </button>
+          <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex justify-between items-center">
+            <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center">
+              <Layers className="w-4 h-4 mr-2 text-emerald-400"/> Workspace KML Files ({fileGroups.length})
+            </h3>
+            <div className="flex items-center space-x-2">
+              <button onClick={handleDeleteAllKml} className="bg-rose-950/50 hover:bg-rose-900 border border-rose-900 text-rose-400 font-bold py-1.5 px-3 rounded text-xs flex items-center transition-colors cursor-pointer"><Trash2 className="w-3.5 h-3.5 mr-1" /> DELETE ALL</button>
+              <button onClick={syncDevicesToDB} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 px-4 rounded text-xs flex items-center shadow-lg cursor-pointer">
+                <Save className="w-4 h-4 mr-2" /> SAVE TO DB
+              </button>
+            </div>
           </div>
-        </div>
         <div className="flex-1 overflow-auto p-0">
           {fileGroups.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-slate-600 font-mono text-sm">
@@ -810,6 +986,7 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
     return match ? (match.color || '#3b82f6') : '#3b82f6';
   };
 
+  // Memoized so it's stable and doesn't recreate every 500ms
   const visibleDevices = useMemo(() => mapDevices.filter(dev => {
     if (!dev || !dev.type) return false;
     if (dev.type.toUpperCase().includes('ENV')) {
@@ -818,9 +995,11 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
     return !hiddenLayers['HARDWARE_SENSORS'];
   }), [mapDevices, hiddenLayers]);
 
-  const displayedAlerts = useMemo(() => 
-    (showAll ? safeAlerts : safeAlerts.slice(-1000)).filter(() => !hiddenLayers['LIVE_ALERTS']), 
-  [safeAlerts, showAll, hiddenLayers]);
+  // Fast evaluation. Skips massive loops if LIVE_ALERTS layer is hidden
+  const displayedAlerts = useMemo(() => {
+    if (hiddenLayers['LIVE_ALERTS']) return [];
+    return showAll ? safeAlerts : safeAlerts.slice(-1000);
+  }, [safeAlerts, showAll, hiddenLayers]);
 
   return (
     <div className="p-6 space-y-4 max-w-[1600px] mx-auto h-[calc(100vh-4rem)] flex flex-col font-sans relative">
@@ -941,117 +1120,12 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
         <MapContainer key={mapCenter.join(',')} center={mapCenter} zoom={13} className="h-full w-full z-0" style={{ background: '#f8fafc' }} preferCanvas={true}>
           <TileLayer attribution='&copy; CartoDB' url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png" />
           
-          {visibleDevices.map((dev, idx) => {
-            if (!dev || !dev.type) return null;
-            const isEnv = dev.type.toUpperCase().includes('ENV');
-            const isPids = dev.type.toUpperCase().includes('PIDS');
-            
-            const fov = parseFloat(dev.fov || 360);
-            const outerRange = parseFloat(dev.outerRange || 100);
-            const innerRange = parseFloat(dev.innerRange || 0);
-            
-            const isDirectional = fov < 360;
-            const isMicroSensor = outerRange <= 2.0;
+          {/* OPTIMIZATION: Render Heavy KMLs and Devices in Memoized Layer */}
+          <StaticEnvironmentLayer visibleDevices={visibleDevices} />
+          
+          {/* OPTIMIZATION: Render Alerts in separate Memoized Layer */}
+          <LiveAlertsLayer displayedAlerts={displayedAlerts} mapDevices={mapDevices} />
 
-            const layerColor = dev.color || "#3b82f6";
-            const safePoly = Array.isArray(dev.polygon) ? dev.polygon : [];
-            const isLine = ['ROAD', 'RAILWAY'].includes(dev.envCategory);
-            
-            return (
-              <React.Fragment key={dev.id || `dev-${idx}`}>
-                {/* ENVIRONMENTAL POLYGONS */}
-                {isEnv && dev.isPolygon && safePoly.length > 0 && (
-                  isLine ? (
-                    <LeafletPolyline positions={safePoly} pathOptions={{ color: layerColor, weight: 2.5 }}>
-                      <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
-                    </LeafletPolyline>
-                  ) : (
-                    <LeafletPolygon positions={safePoly} pathOptions={{ color: layerColor, fillColor: layerColor, fillOpacity: dev.envCategory === 'BUILDING' ? 0.55 : 0.35, weight: dev.envCategory === 'PERIMETER' ? 3.5 : 1.5 }}>
-                      <Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup>
-                    </LeafletPolygon>
-                  )
-                )}
-                
-                {/* ENVIRONMENTAL POINTS */}
-                {isEnv && !dev.isPolygon && dev.lat != null && dev.lng != null && (
-                  <CircleMarker center={[dev.lat, dev.lng]} radius={4} pathOptions={{ color: '#ffffff', fillColor: layerColor, fillOpacity: 1, weight: 1.5 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>File: {dev.sourceFile}</Popup></CircleMarker>
-                )}
-
-                {/* THE PIDS EXCEPTION (Perimeter Fences) */}
-                {isPids && dev.isPolygon && safePoly.length > 0 && !isEnv && (
-                  <LeafletPolygon positions={safePoly} pathOptions={{ color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.3, weight: 3 }}><Popup className="font-mono text-xs"><strong>{dev.id}</strong><br/>PIDS Perimeter Array</Popup></LeafletPolygon>
-                )}
-
-                {/* PHYSICS-BASED DIRECTIONAL (FOV < 360) */}
-                {!dev.isPolygon && !isEnv && isDirectional && !isMicroSensor && dev.lat != null && dev.lng != null && (
-                  <LeafletPolygon positions={getDirectionalFovPolygon(dev.lat, dev.lng, outerRange, dev.azimuth, fov)} pathOptions={{ color: '#eab308', fillColor: '#eab308', fillOpacity: 0.25, weight: 1.5 }} />
-                )}
-
-                {/* PHYSICS-BASED OMNIDIRECTIONAL (FOV = 360) */}
-{!dev.isPolygon && !isEnv && !isDirectional && !isMicroSensor && dev.lat != null && dev.lng != null && (
-  <>
-    <Circle center={[dev.lat, dev.lng]} radius={outerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.1, weight: 1.5, dashArray: "5, 5" }} />
-    {innerRange > 0 && (
-      <Circle center={[dev.lat, dev.lng]} radius={innerRange} pathOptions={{ color: '#ef4444', fillOpacity: 0.0, weight: 2 }} />
-    )}
-  </>
-)}
-
-                {/* DYNAMIC SENSOR PIN */}
-                {!dev.isPolygon && !isEnv && dev.lat != null && dev.lng != null && (
-                  <CircleMarker 
-                      center={[dev.lat, dev.lng]} 
-                      radius={isMicroSensor ? 4 : 5} 
-                      pathOptions={{ 
-                          color: '#0f172a', 
-                          fillColor: isMicroSensor ? '#a855f7' : (isDirectional ? '#eab308' : '#ef4444'), 
-                          fillOpacity: 1, 
-                          weight: 2 
-                      }}
-                  >
-                      <Popup className="font-mono text-xs">
-                          <strong className="block text-sm mb-1">{dev.id}</strong>
-                          Type: {dev.type}
-                      </Popup>
-                  </CircleMarker>
-                )}
-              </React.Fragment>
-            );
-          })}
-
-          {displayedAlerts.map((alert, idx) => {
-             const lat = alert.latitude ?? (alert.loc ? alert.loc[0] : null);
-             const lng = alert.longitude ?? (alert.loc ? alert.loc[1] : null);
-             if (lat == null || lng == null) return null;
-             
-             // Cross-reference alert with parent device to inherit its physics color profile
-             const sourceDev = mapDevices.find(d => d.id === (alert.sensor_name || alert.id));
-             let pinColor = '#22c55e'; // Default Low Priority Green Fallback
-
-             if (sourceDev) {
-                 const outerRange = parseFloat(sourceDev.outerRange || 100);
-                 const fov = parseFloat(sourceDev.fov || 360);
-                 const isMicro = outerRange <= 2.0;
-                 const isDir = fov < 360;
-                 pinColor = isMicro ? '#a855f7' : (isDir ? '#facc15' : '#ef4444');
-             } else if (String(alert.sensor_type).toUpperCase().includes('PIDS')) {
-                 pinColor = '#facc15'; // Legacy PIDS fallback
-             }
-             
-             return (
-                 <CircleMarker 
-                     key={`alert-${alert.alert_id || alert.id || idx}`} 
-                     center={[lat, lng]} 
-                     radius={5} 
-                     pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}
-                 >
-                     <Popup className="font-mono text-xs">
-                         <strong className="block text-sm mb-1">{alert.sensor_type || 'UNKNOWN'} ALERT</strong>
-                         Track ID: {alert.alert_id || alert.id || 'N/A'}
-                     </Popup>
-                 </CircleMarker>
-             );
-          })}
         </MapContainer>
       </div>
     </div>
@@ -1280,8 +1354,12 @@ export default function App() {
     } catch (e) { return []; }
   });
 
+  // OPTIMIZATION: Debounce the heavy disk I/O of saving logs to localStorage
   useEffect(() => {
-    localStorage.setItem('simcore_telemetry', JSON.stringify(simLogs));
+    const timerId = setTimeout(() => {
+      localStorage.setItem('simcore_telemetry', JSON.stringify(simLogs));
+    }, 1500); 
+    return () => clearTimeout(timerId);
   }, [simLogs]);
 
   useEffect(() => {
@@ -1329,12 +1407,17 @@ export default function App() {
       .then(res => res.json()).then(data => { setActiveAlerts(Array.isArray(data) ? data : []); }).catch(e => console.error(e));
   }, []);
 
+  // OPTIMIZATION: Backpressure Polling. Waits for previous fetch to complete before firing next, saving browser network stack
   useEffect(() => {
-    const interval = setInterval(() => {
+    let isSubscribed = true;
+    
+    const pollStatus = () => {
+        if (!isSubscribed) return;
+        
         fetch('/api/engine/status')
             .then(res => res.json())
             .then(data => {
-                if(!data) return;
+                if(!data || !isSubscribed) return;
                 
                 setSimIsRunning(prev => prev === !!data.is_running ? prev : !!data.is_running);
                 setSimProgress(prev => prev === data.progress ? prev : (data.progress || 0)); 
@@ -1357,18 +1440,22 @@ export default function App() {
                     fetchHistory();
                     fetch('/api/state/alerts')
                         .then(r => r.json())
-                        .then(alerts => setActiveAlerts(prev => {
-                            const newAlerts = Array.isArray(alerts) ? alerts : [];
-                            if (prev.length === newAlerts.length) return prev;
-                            return newAlerts;
-                        }));
+                        .then(alerts => {
+                            if (isSubscribed) setActiveAlerts(Array.isArray(alerts) ? alerts : []);
+                        });
                 }
                 previousRunningState.current = !!data.is_running;
+                
+                setTimeout(pollStatus, 500); // Trigger next request ONLY after this one completes
             })
-            .catch(() => {});
-    }, 500); 
+            .catch(() => {
+                if (isSubscribed) setTimeout(pollStatus, 1500); // Backoff if network chokes
+            });
+    };
     
-    return () => clearInterval(interval);
+    pollStatus();
+    
+    return () => { isSubscribed = false; };
   }, []);
 
   const startSimulation = async () => {
