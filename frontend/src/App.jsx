@@ -706,7 +706,15 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
         }
     }));
   };
-
+  const handleDomainChange = (deviceId, domain) => {
+    setScenario(prev => ({
+        ...prev,
+        deviceDomainMapping: {
+            ...(prev.deviceDomainMapping || {}),
+            [deviceId]: domain
+        }
+    }));
+  };
   const getEventsForDevice = (type) => {
     if (!sensorEvents) return [];
     const t = String(type).toUpperCase();
@@ -822,18 +830,32 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                   </div>
 
                   {isActive && events.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-slate-800/50 flex items-center justify-between" onClick={e => e.stopPropagation()}>
-                          <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">Target Signature</span>
-                          <select
-                              value={selectedTargetId}
-                              onChange={(e) => handleTargetChange(dev.id, e.target.value)}
-                              className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-indigo-300 font-mono focus:border-indigo-500 focus:outline-none cursor-pointer max-w-[150px] truncate"
-                          >
-                              <option value="">-- Default --</option>
-                              {events.map(ev => (
-                                  <option key={ev.id} value={ev.id}>{ev.name} (ID: {ev.id})</option>
-                              ))}
-                          </select>
+                      <div className="mt-3 pt-3 border-t border-slate-800/50 flex flex-col space-y-3" onClick={e => e.stopPropagation()}>
+                          <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">Target Signature</span>
+                              <select
+                                  value={selectedTargetId}
+                                  onChange={(e) => handleTargetChange(dev.id, e.target.value)}
+                                  className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-indigo-300 font-mono focus:border-indigo-500 focus:outline-none cursor-pointer w-[160px] truncate"
+                              >
+                                  <option value="">-- Default --</option>
+                                  {events.map(ev => (
+                                      <option key={ev.id} value={ev.id}>{ev.name} (ID: {ev.id})</option>
+                                  ))}
+                              </select>
+                          </div>
+                          <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">Kinematic Domain</span>
+                              <select
+                                  value={scenario?.deviceDomainMapping?.[dev.id] || 'GROUND'}
+                                  onChange={(e) => handleDomainChange(dev.id, e.target.value)}
+                                  className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-emerald-400 font-mono focus:border-emerald-500 focus:outline-none cursor-pointer w-[160px]"
+                              >
+                                  <option value="GROUND">Terrestrial (Ground)</option>
+                                  <option value="AIRBORNE">Airborne (Flight)</option>
+                                  <option value="BOTH">Mixed (Both)</option>
+                              </select>
+                          </div>
                       </div>
                   )}
 

@@ -57,6 +57,8 @@ try:
         except: pass
         try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN devicealertmapping TEXT DEFAULT '{}';"))
         except: pass
+        try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN devicedomainmapping TEXT DEFAULT '{}';"))
+        except: pass
 except Exception as e:
     print("\nWARNING: Could not connect to PostgreSQL Database:", e)
 
@@ -120,6 +122,7 @@ class ScenarioModel(BaseModel):
     workspace: Optional[str] = "Default"
     kmlProbabilities: Optional[dict] = {}
     deviceAlertMapping: Optional[dict] = {}
+    deviceDomainMapping: Optional[dict] = {}
 
 class RangeExportRequest(BaseModel):
     startTime: str
@@ -162,12 +165,29 @@ def get_distance_bearing(lat1, lon1, lat2, lon2):
     bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
     return dist, bearing
 
-def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, device_alert_mapping):
+def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, device_alert_mapping, device_domain_mapping):
     clean_type = device.clean_type
     chosen_target_type = device_alert_mapping.get(device.id)
 
+    # --- 3D KINEMATIC DOMAIN ENGINE ---
+    domain = device_domain_mapping.get(device.id, "GROUND")
+    if domain == "BOTH":
+        domain = random.choice(["GROUND", "AIRBORNE"])
+        
+    dist_m = alert.get("distance_m", 0)
+    
+    if domain == "AIRBORNE":
+        target_height = round(random.uniform(25, 300), 2)       # Drone flying between 25m and 300m
+        target_speed = round(random.uniform(30, 120), 2)        # Flight speed 30-120 km/h
+        # Trigonometry: Angle = atan(Opposite / Adjacent)
+        target_elevation = round(math.degrees(math.atan2(target_height, dist_m)), 2) if dist_m > 0 else 90.0
+    else:
+        target_height = 0
+        target_speed = round(random.uniform(2, 15), 2)          # Ground walking/driving speed
+        target_elevation = 0
+    # ----------------------------------
+
     if not pre_sorted_schema:
-        # Legacy hardcoded fallback
         clean_id = str(device.id).replace("RADAR_", "").replace("CAM_", "").replace("PIDS_", "")
         if "PIDS" in clean_type:
             target_val = chosen_target_type if chosen_target_type is not None else 1112
@@ -199,11 +219,22 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
         elif 'devicelong' in fname or 'devicelng' in fname or ('lon' in fname and 'target' not in fname): val = round(device.lng, 6)
         elif 'targetlat' in fname or 'alertlat' in fname: val = round(alert["latitude"], 8)
         elif 'targetlong' in fname or 'alertlong' in fname: val = round(alert["longitude"], 8)
-        elif 'range' in fname or 'distance' in fname: val = round(alert.get("distance_m", 0), 2)
+        elif 'range' in fname or 'distance' in fname: val = round(dist_m, 2)
         elif 'bearing' in fname and 'device' not in fname: val = round(alert.get("bearing", 0), 2)
+        
+        # --- DYNAMIC FOV BOUNDARY CALCULATORS ---
+        elif 'fovstart' in fname: 
+            val = 0 if device.fov >= 360 else round((device.azimuth - (device.fov / 2)) % 360, 2)
+        elif 'fovend' in fname: 
+            val = 360 if device.fov >= 360 else round((device.azimuth + (device.fov / 2)) % 360, 2)
+            
+        # --- 3D FLIGHT METRICS ---
+        elif 'targetspeed' in fname or 'velocity' in fname: val = target_speed
+        elif 'targetelevation' in fname or 'pitch' in fname: val = target_elevation
+        elif 'targetheight' in fname or 'altitude' in fname: val = target_height
+            
         elif 'trackid' in fname or 'nodeid' in fname: val = track_id
         elif 'time' in fname or 'timestamp' in fname: val = int(time.time())
-        elif 'targettype' in fname: val = 0 
         elif 'otherinfo' in fname or 'analyticname' in fname: val = str(chosen_target_type) if chosen_target_type else "System Event"
         
         if dtype == 'Integer':
@@ -239,7 +270,6 @@ def build_spatial_indices(env_devices):
                 if shapely_coords[0] != shapely_coords[-1]:
                     shapely_coords.append(shapely_coords[0])
                 line = ShapelyLineString(shapely_coords)
-                # Cache length for fast interpolation
                 lines.setdefault(src_file, []).append({"geom": line, "length": line.length})
             elif "ROAD" in cat or "RAIL" in cat or len(shapely_coords) == 2:
                 line = ShapelyLineString(shapely_coords)
@@ -247,11 +277,8 @@ def build_spatial_indices(env_devices):
             elif len(shapely_coords) >= 3:
                 poly = ShapelyPolygon(shapely_coords)
                 rep = poly.representative_point()
-                # CPU/RAM OPTIMIZATION: Cache bounds and rep point once!
                 polygons.setdefault(src_file, []).append({
-                    "geom": poly,
-                    "bounds": poly.bounds,
-                    "rep_point": (rep.y, rep.x)
+                    "geom": poly, "bounds": poly.bounds, "rep_point": (rep.y, rep.x)
                 })
         except Exception: continue
 
@@ -305,7 +332,6 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
                     if is_valid_physics(dist, bearing):
                         return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
             
-            # Use pre-calculated rep point to save CPU
             rep_y, rep_x = cached_poly["rep_point"]
             dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, rep_y, rep_x)
             if is_valid_physics(dist, bearing):
@@ -347,17 +373,14 @@ class OptimizedDevice:
         self.polygon = d.get('polygon', [])
         self.packetChoice = d.get('packetChoice', '')
 
-def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping):
+def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping):
     global engine_state
     
-    # --- RAM OPTIMIZATION 1: Normalizer ---
     if kml_probs:
         total_prob_sum = sum(float(p) for p in kml_probs.values())
         if total_prob_sum > 1.0:
             kml_probs = {k: (float(v) / total_prob_sum) for k, v in kml_probs.items()}
 
-    # --- RAM OPTIMIZATION 2: The Smart Counter Pool ---
-    # Drops RAM usage from 1,000,000 array items down to ~50 dictionary objects!
     task_pool = []
     total_alerts_requested = 0
 
@@ -366,7 +389,6 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         if dev_total <= 0: continue
         total_alerts_requested += dev_total
         
-        # Pre-build device object to save CPU inside loop
         d_obj = OptimizedDevice(dev_dict)
         
         allocated = 0
@@ -386,14 +408,13 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         engine_state['should_abort'] = False
         engine_state['progress'] = 0
         engine_state['total'] = total_alerts_requested
-        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. Memory-Optimized Physics Engine Active.", "type": "info"}]
+        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. 3D Kinematic Engine Active.", "type": "info"}]
         engine_state['map_alerts'] = []
 
     if total_alerts_requested == 0 or not task_pool:
         with engine_lock: engine_state['is_running'] = False
         return
 
-    # Cache Geometries
     polygons, lines = build_spatial_indices(env_devices)
     
     schema_cache = {}
@@ -423,14 +444,12 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
     ui_alerts = deque(maxlen=1000)
     db_chunk = []
 
-    # --- THE OPTIMIZED TRANSMISSION LOOP ---
     for current_idx in range(total_alerts_requested):
         with engine_lock:
             if engine_state['should_abort']:
                 engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": "SYSTEM: Transmission Aborted manually.", "type": "error"})
                 break
 
-        # Fast Random Task Selection (Simulates a perfect shuffle without RAM cost)
         task_idx = random.randrange(len(task_pool))
         current_task = task_pool[task_idx]
         
@@ -453,18 +472,17 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
         sel_schema = cache_entry['schema'] if cache_entry else None
         sel_sep = cache_entry['separator'] if cache_entry else ","
 
-        packet_string = build_dynamic_packet(alert_data, d_obj, track_id, sel_schema, sel_sep, device_alert_mapping)
+        # PASSING THE DOMAIN MAPPING CORRECTLY HERE
+        packet_string = build_dynamic_packet(alert_data, d_obj, track_id, sel_schema, sel_sep, device_alert_mapping, device_domain_mapping)
         
         try: udp_socket.sendto(packet_string.encode('utf-8'), (str(udpIp), int(udpPort)))
         except Exception: pass
 
-        # Database flush management
         if len(db_chunk) >= 5000:
             db.bulk_insert_mappings(AlertLog, db_chunk)
             db.commit()
             db_chunk.clear()
 
-        # UI Updates
         if current_idx % 1 == 0 or current_idx == total_alerts_requested - 1:
             with engine_lock:
                 engine_state['progress'] = current_idx + 1
@@ -473,7 +491,6 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                 if len(engine_state['logs']) > 50:
                     engine_state['logs'] = engine_state['logs'][:50]
 
-        # Task Management Cleanup (O(1) fast removal)
         current_task["remaining"] -= 1
         if current_task["remaining"] <= 0:
             task_pool[task_idx] = task_pool[-1]
@@ -547,7 +564,8 @@ def api_engine_start(payload: dict):
             payload["scenarioName"], payload["udpIp"], payload["udpPort"],
             payload["activeDevices"], payload["environmentDevices"], payload["sensorSchemas"],
             payload["alertConfig"]["minDelaySec"], payload["alertConfig"]["maxDelaySec"],
-            payload.get("kmlProbabilities", {}), payload.get("deviceAlertMapping", {})
+            payload.get("kmlProbabilities", {}), payload.get("deviceAlertMapping", {}),
+            payload.get("deviceDomainMapping", {})  # PASSING THE DOMAIN MAPPING CORRECTLY HERE
         ),
         daemon=True
     )
@@ -749,6 +767,7 @@ def delete_schema(schema_name: str, db: Session = Depends(get_db)):
 def get_scenario_state(workspace_name: str, db: Session = Depends(get_db)):
     s = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == workspace_name).first()
     if s: 
+        # Safely extract dynamic columns using getattr in case DB wasn't updated via raw SQL
         return { 
             "name": s.name, 
             "activeDevices": json.loads(s.activeDevices) if s.activeDevices else [], 
@@ -756,9 +775,10 @@ def get_scenario_state(workspace_name: str, db: Session = Depends(get_db)):
             "udpPort": s.udpPort, 
             "workspace": s.workspace,
             "kmlProbabilities": json.loads(s.kmlProbabilities) if s.kmlProbabilities else {},
-            "deviceAlertMapping": json.loads(s.deviceAlertMapping) if getattr(s, 'deviceAlertMapping', None) else {}
+            "deviceAlertMapping": json.loads(getattr(s, 'devicealertmapping', '{}')) if getattr(s, 'devicealertmapping', None) else {},
+            "deviceDomainMapping": json.loads(getattr(s, 'devicedomainmapping', '{}')) if getattr(s, 'devicedomainmapping', None) else {}
         }
-    return { "name": f"{workspace_name} Mission", "activeDevices": [], "udpIp": "127.0.0.1", "udpPort": 5005, "workspace": workspace_name, "kmlProbabilities": {}, "deviceAlertMapping": {} }
+    return { "name": f"{workspace_name} Mission", "activeDevices": [], "udpIp": "127.0.0.1", "udpPort": 5005, "workspace": workspace_name, "kmlProbabilities": {}, "deviceAlertMapping": {}, "deviceDomainMapping": {} }
 
 @app.post("/api/state/scenario")
 def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
@@ -768,6 +788,7 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
     dev_str = json.dumps(payload.activeDevices)
     prob_str = json.dumps(payload.kmlProbabilities) if payload.kmlProbabilities else "{}"
     map_str = json.dumps(payload.deviceAlertMapping) if getattr(payload, 'deviceAlertMapping', None) else "{}"
+    domain_str = json.dumps(payload.deviceDomainMapping) if getattr(payload, 'deviceDomainMapping', None) else "{}"
     
     if s:
         s.name = payload.name
@@ -776,7 +797,8 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
         s.udpPort = payload.udpPort
         s.workspace = target_workspace
         s.kmlProbabilities = prob_str
-        s.deviceAlertMapping = map_str
+        # Directly writing using raw SQL to bypass SQLAlchemy strict column mapping limitations
+        db.execute(text("UPDATE scenario_state SET devicealertmapping = :am, devicedomainmapping = :dm WHERE id = :id"), {"am": map_str, "dm": domain_str, "id": target_workspace})
     else:
         new_s = ScenarioStateDB(
             id=target_workspace, 
@@ -785,9 +807,11 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
             udpIp=payload.udpIp, 
             udpPort=payload.udpPort, 
             workspace=target_workspace,
-            kmlProbabilities=prob_str,
-            deviceAlertMapping=map_str
+            kmlProbabilities=prob_str
         )
         db.add(new_s)
+        db.commit()
+        db.execute(text("UPDATE scenario_state SET devicealertmapping = :am, devicedomainmapping = :dm WHERE id = :id"), {"am": map_str, "dm": domain_str, "id": target_workspace})
+    
     db.commit()
     return {"status": "success"}
