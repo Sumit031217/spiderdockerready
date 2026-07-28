@@ -23,19 +23,6 @@ from sqlalchemy import text
 from database import SessionLocal, engine, Base, SimulationRun, AlertLog, DeviceConfigDB, SchemaConfigDB, ScenarioStateDB, SensorEventDB
 
 # ==========================================================
-# SAFE ALERT ENGINE IMPORT
-# ==========================================================
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-try:
-    from src.alert_engine import AlertEngine
-except ModuleNotFoundError:
-    try:
-        from alert_engine import AlertEngine
-    except ModuleNotFoundError:
-        raise RuntimeError("CRITICAL: Could not find 'alert_engine.py'. Ensure it is saved in simcore-backend/")
-
-# ==========================================================
 # DATABASE INITIALIZATION
 # ==========================================================
 try:
@@ -58,6 +45,10 @@ try:
         try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN devicealertmapping TEXT DEFAULT '{}';"))
         except: pass
         try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN devicedomainmapping TEXT DEFAULT '{}';"))
+        except: pass
+        try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN deviceswarmmode TEXT DEFAULT '{}';"))
+        except: pass
+        try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN deviceswarmsize TEXT DEFAULT '{}';"))
         except: pass
 except Exception as e:
     print("\nWARNING: Could not connect to PostgreSQL Database:", e)
@@ -123,6 +114,8 @@ class ScenarioModel(BaseModel):
     kmlProbabilities: Optional[dict] = {}
     deviceAlertMapping: Optional[dict] = {}
     deviceDomainMapping: Optional[dict] = {}
+    deviceSwarmMode: Optional[dict] = {}
+    deviceSwarmSize: Optional[dict] = {}
 
 class RangeExportRequest(BaseModel):
     startTime: str
@@ -176,16 +169,20 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
         
     dist_m = alert.get("distance_m", 0)
     
-    if domain == "AIRBORNE":
-        target_height = round(random.uniform(25, 300), 2)       # Drone flying between 25m and 300m
-        target_speed = round(random.uniform(30, 120), 2)        # Flight speed 30-120 km/h
-        # Trigonometry: Angle = atan(Opposite / Adjacent)
+# --- SWARM STATE OVERRIDE ---
+    if alert.get("is_swarm"):
+        target_height = alert.get("height", 0)
+        target_speed = alert.get("speed", 0)
+        target_elevation = alert.get("elevation", 0)
+    # --- NORMAL MODE ---
+    elif domain == "AIRBORNE":
+        target_height = round(random.uniform(25, 300), 2)
+        target_speed = round(random.uniform(30, 120), 2)
         target_elevation = round(math.degrees(math.atan2(target_height, dist_m)), 2) if dist_m > 0 else 90.0
     else:
         target_height = 0
-        target_speed = round(random.uniform(2, 15), 2)          # Ground walking/driving speed
+        target_speed = round(random.uniform(2, 15), 2)
         target_elevation = 0
-    # ----------------------------------
 
     if not pre_sorted_schema:
         clean_id = str(device.id).replace("RADAR_", "").replace("CAM_", "").replace("PIDS_", "")
@@ -222,13 +219,9 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
         elif 'range' in fname or 'distance' in fname: val = round(dist_m, 2)
         elif 'bearing' in fname and 'device' not in fname: val = round(alert.get("bearing", 0), 2)
         
-        # --- DYNAMIC FOV BOUNDARY CALCULATORS ---
-        elif 'fovstart' in fname: 
-            val = 0 if device.fov >= 360 else round((device.azimuth - (device.fov / 2)) % 360, 2)
-        elif 'fovend' in fname: 
-            val = 360 if device.fov >= 360 else round((device.azimuth + (device.fov / 2)) % 360, 2)
+        elif 'fovstart' in fname: val = 0 if device.fov >= 360 else round((device.azimuth - (device.fov / 2)) % 360, 2)
+        elif 'fovend' in fname: val = 360 if device.fov >= 360 else round((device.azimuth + (device.fov / 2)) % 360, 2)
             
-        # --- 3D FLIGHT METRICS ---
         elif 'targetspeed' in fname or 'velocity' in fname: val = target_speed
         elif 'targetelevation' in fname or 'pitch' in fname: val = target_elevation
         elif 'targetheight' in fname or 'altitude' in fname: val = target_height
@@ -250,7 +243,7 @@ def build_dynamic_packet(alert, device, track_id, pre_sorted_schema, separator, 
     return separator.join(packet)
 
 # ==========================================================
-# CACHED SPATIAL ENGINE WITH PHYSICS VALIDATOR
+# CACHED SPATIAL ENGINE WITH PRE-FLIGHT INDEXER
 # ==========================================================
 def build_spatial_indices(env_devices):
     polygons = {}
@@ -258,7 +251,8 @@ def build_spatial_indices(env_devices):
 
     for env in env_devices:
         poly_coords = env.get("polygon", [])
-        src_file = str(env.get("sourceFile", "Uploaded KML"))
+        # Force all dictionary keys to be clean, uppercase strings
+        src_file = str(env.get("sourceFile", "Uploaded KML")).strip().upper()
         cat = str(env.get("envCategory", "")).upper()
         if not poly_coords or len(poly_coords) < 2: continue
         
@@ -267,24 +261,59 @@ def build_spatial_indices(env_devices):
 
         try:
             if is_perimeter:
-                if shapely_coords[0] != shapely_coords[-1]:
-                    shapely_coords.append(shapely_coords[0])
+                if shapely_coords[0] != shapely_coords[-1]: shapely_coords.append(shapely_coords[0])
                 line = ShapelyLineString(shapely_coords)
-                lines.setdefault(src_file, []).append({"geom": line, "length": line.length})
+                mid = line.interpolate(0.5, normalized=True)
+                lines.setdefault(src_file, []).append({"geom": line, "length": line.length, "rep_point": (mid.y, mid.x)})
             elif "ROAD" in cat or "RAIL" in cat or len(shapely_coords) == 2:
                 line = ShapelyLineString(shapely_coords)
-                lines.setdefault(src_file, []).append({"geom": line, "length": line.length})
+                mid = line.interpolate(0.5, normalized=True)
+                lines.setdefault(src_file, []).append({"geom": line, "length": line.length, "rep_point": (mid.y, mid.x)})
             elif len(shapely_coords) >= 3:
                 poly = ShapelyPolygon(shapely_coords)
                 rep = poly.representative_point()
-                polygons.setdefault(src_file, []).append({
-                    "geom": poly, "bounds": poly.bounds, "rep_point": (rep.y, rep.x)
-                })
+                polygons.setdefault(src_file, []).append({"geom": poly, "bounds": poly.bounds, "rep_point": (rep.y, rep.x)})
         except Exception: continue
 
     return polygons, lines
 
-def sample_spatial_point(d_obj, polygons, lines, target_assignment):
+def precompute_device_targets(active_devices, polygons, lines):
+    cache = {}
+    # FIX: Now loops over active_devices directly instead of task_pool
+    for dev_dict in active_devices:
+        d_obj = OptimizedDevice(dev_dict)
+        if d_obj.id in cache: continue
+        cache[d_obj.id] = {"polygons": {}, "lines": {}}
+        
+        def is_roughly_visible(dist, bearing):
+            if dist > d_obj.outerRange + 500: return False
+            if d_obj.fov < 360:
+                start_b = (d_obj.azimuth - (d_obj.fov / 2) - 30) % 360
+                end_b = (d_obj.azimuth + (d_obj.fov / 2) + 30) % 360
+                if start_b <= end_b:
+                    if not (start_b <= bearing <= end_b): return False
+                else:
+                    if not (bearing >= start_b or bearing <= end_b): return False
+            return True
+
+        for fname, poly_list in polygons.items():
+            valid_polys = []
+            for p in poly_list:
+                dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, p["rep_point"][0], p["rep_point"][1])
+                if is_roughly_visible(dist, bearing): valid_polys.append(p)
+            cache[d_obj.id]["polygons"][fname] = valid_polys
+            
+        for fname, line_list in lines.items():
+            valid_lines = []
+            for l in line_list:
+                dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, l["rep_point"][0], l["rep_point"][1])
+                if is_roughly_visible(dist, bearing): valid_lines.append(l)
+            cache[d_obj.id]["lines"][fname] = valid_lines
+            
+    return cache
+
+
+def sample_spatial_point(d_obj, target_assignment, device_target_cache):
     clean_type = d_obj.clean_type
     
     if "PIDS" in clean_type and d_obj.isPolygon and d_obj.polygon and len(d_obj.polygon) > 1:
@@ -299,8 +328,7 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
         return round(dest_lat, 8), round(dest_lng, 8), round(offset_dist, 2), round(offset_bearing, 2), "HIGH"
 
     def is_valid_physics(dist, bearing):
-        if not (d_obj.innerRange <= dist <= d_obj.outerRange): 
-            return False
+        if not (d_obj.innerRange <= dist <= d_obj.outerRange): return False
         if d_obj.fov < 360:
             start_b = (d_obj.azimuth - (d_obj.fov / 2)) % 360
             end_b = (d_obj.azimuth + (d_obj.fov / 2)) % 360
@@ -320,40 +348,59 @@ def sample_spatial_point(d_obj, polygons, lines, target_assignment):
         return get_random_point()
 
     try:
-        if target_assignment in polygons and polygons[target_assignment]:
-            cached_poly = random.choice(polygons[target_assignment])
-            poly = cached_poly["geom"]
-            minx, miny, maxx, maxy = cached_poly["bounds"]
+        # --- POLYGON STRICT CHECK ---
+        if target_assignment in device_target_cache[d_obj.id]["polygons"]:
+            valid_polys = device_target_cache[d_obj.id]["polygons"][target_assignment]
+            if not valid_polys:
+                return get_random_point()
             
-            for _ in range(50):
-                pnt = ShapelyPoint(random.uniform(minx, maxx), random.uniform(miny, maxy))
-                if poly.contains(pnt):
+            # Shuffle the roughly visible buildings so we check randomly
+            shuffled_polys = valid_polys[:]
+            random.shuffle(shuffled_polys)
+            
+            for cached_poly in shuffled_polys:
+                poly = cached_poly["geom"]
+                minx, miny, maxx, maxy = cached_poly["bounds"]
+                
+                # Try to find a STRICTLY VALID point inside this specific building
+                for _ in range(30):
+                    pnt = ShapelyPoint(random.uniform(minx, maxx), random.uniform(miny, maxy))
+                    if poly.contains(pnt):
+                        dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
+                        # NO FORCING. If it fails this strict check, it loops again.
+                        if is_valid_physics(dist, bearing):
+                            return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+            
+            # If we checked EVERY roughly visible building and none intersect the strict physics cone...
+            # We absolutely DO NOT force it. We fall back to random inside the valid FOV.
+            return get_random_point()
+                
+        # --- LINE STRICT CHECK ---
+        if target_assignment in device_target_cache[d_obj.id]["lines"]:
+            valid_lines = device_target_cache[d_obj.id]["lines"][target_assignment]
+            if not valid_lines:
+                return get_random_point()
+                
+            shuffled_lines = valid_lines[:]
+            random.shuffle(shuffled_lines)
+            
+            for cached_line in shuffled_lines:
+                line = cached_line["geom"]
+                line_len = cached_line["length"]
+                
+                for _ in range(20):
+                    rand_dist = random.random() * line_len
+                    pnt = line.interpolate(rand_dist)
                     dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
                     if is_valid_physics(dist, bearing):
                         return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
             
-            rep_y, rep_x = cached_poly["rep_point"]
-            dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, rep_y, rep_x)
-            if is_valid_physics(dist, bearing):
-                return round(rep_y, 8), round(rep_x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
-                
-        if target_assignment in lines and lines[target_assignment]:
-            cached_line = random.choice(lines[target_assignment])
-            line = cached_line["geom"]
-            line_len = cached_line["length"]
-            
-            for _ in range(15):
-                rand_dist = random.random() * line_len
-                pnt = line.interpolate(rand_dist)
-                dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
-                if is_valid_physics(dist, bearing):
-                    return round(pnt.y, 8), round(pnt.x, 8), round(dist, 2), round(bearing, 2), determine_priority(dist)
+            return get_random_point()
             
     except Exception:
         pass
         
     return get_random_point()
-
 # ==========================================================
 # THE HIGH PERFORMANCE ENGINE WORKER (MEMORY OPTIMIZED)
 # ==========================================================
@@ -373,146 +420,267 @@ class OptimizedDevice:
         self.polygon = d.get('polygon', [])
         self.packetChoice = d.get('packetChoice', '')
 
-def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping):
+def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping, device_swarm_mode, device_swarm_size):
     global engine_state
     
-    if kml_probs:
-        total_prob_sum = sum(float(p) for p in kml_probs.values())
-        if total_prob_sum > 1.0:
-            kml_probs = {k: (float(v) / total_prob_sum) for k, v in kml_probs.items()}
-
-    task_pool = []
-    total_alerts_requested = 0
-
-    for dev_dict in active_devices:
-        dev_total = int(dev_dict.get('alertCount', 0))
-        if dev_total <= 0: continue
-        total_alerts_requested += dev_total
-        
-        d_obj = OptimizedDevice(dev_dict)
-        
-        allocated = 0
-        if kml_probs:
-            for fname, prob in kml_probs.items():
-                count = int(dev_total * float(prob))
-                if count > 0:
-                    task_pool.append({"dev": d_obj, "target": fname, "remaining": count})
-                    allocated += count
-                    
-        remainder = dev_total - allocated
-        if remainder > 0:
-            task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": remainder})
-
-    with engine_lock:
-        engine_state['is_running'] = True
-        engine_state['should_abort'] = False
-        engine_state['progress'] = 0
-        engine_state['total'] = total_alerts_requested
-        engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. 3D Kinematic Engine Active.", "type": "info"}]
-        engine_state['map_alerts'] = []
-
-    if total_alerts_requested == 0 or not task_pool:
-        with engine_lock: engine_state['is_running'] = False
-        return
-
-    polygons, lines = build_spatial_indices(env_devices)
-    
-    schema_cache = {}
-    for s in schemas:
-        schema_cache[str(s.get('name', '')).upper()] = {
-            "schema": sorted(s.get('schema', []), key=lambda x: x.get('index', 0)),
-            "separator": str(s.get('separator', ','))
-        }
-
-    db = SessionLocal()
-    run_id = None
     try:
-        db_run = SimulationRun(
-            scenario_name=scenarioName, total_alerts=total_alerts_requested, 
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            devices_snapshot=json.dumps(active_devices + env_devices) 
-        )
-        db.add(db_run)
-        db.commit()
-        db.refresh(db_run)
-        run_id = db_run.id
-    except Exception as e:
+        # 1. PRE-FLIGHT INDEXING MUST HAPPEN FIRST!
+        polygons, lines = build_spatial_indices(env_devices)
+        device_target_cache = precompute_device_targets(active_devices, polygons, lines)
+
+        if kml_probs:
+            total_prob_sum = sum(float(p) for p in kml_probs.values())
+            if total_prob_sum > 1.0:
+                kml_probs = {k: (float(v) / total_prob_sum) for k, v in kml_probs.items()}
+
+        task_pool = []
+        total_alerts_requested = 0
+
+        for dev_dict in active_devices:
+            dev_total = int(dev_dict.get('alertCount', 0))
+            if dev_total <= 0: continue
+            total_alerts_requested += dev_total
+            
+            d_obj = OptimizedDevice(dev_dict)
+            is_swarm = device_swarm_mode.get(d_obj.id, False)
+            
+            if is_swarm:
+                swarm_size = int(device_swarm_size.get(d_obj.id, 5))
+                packets_per_drone = max(1, dev_total // max(1, swarm_size))
+                
+                # --- AUTO-SCALING TARGET GEOMETRY ---
+                target_lat, target_lng = d_obj.lat, d_obj.lng 
+                target_radius_m = 30.0 # Default fallback if no KML is found
+                
+                sensor_cache = device_target_cache.get(d_obj.id, {})
+                found_target = False
+                
+                # 1. Hunt for Perimeter and calculate its exact physical radius
+                for p_dict in [sensor_cache.get("polygons", {}), sensor_cache.get("lines", {})]:
+                    for fname, items in p_dict.items():
+                        if "PERIMETER" in fname and items:
+                            target_lat, target_lng = items[0]["rep_point"]
+                            bounds = items[0].get("bounds")
+                            if bounds:
+                                minx, miny, maxx, maxy = bounds
+                                diag_dist, _ = get_distance_bearing(miny, minx, maxy, maxx)
+                                target_radius_m = diag_dist / 2  # The physical half-width of the building
+                            found_target = True
+                            break
+                    if found_target: break
+                    
+                # 2. Fallback to first available building and measure it
+                if not found_target and sensor_cache.get("polygons"):
+                    first_key = list(sensor_cache["polygons"].keys())[0]
+                    if sensor_cache["polygons"][first_key]:
+                        target_lat, target_lng = sensor_cache["polygons"][first_key][0]["rep_point"]
+                        bounds = sensor_cache["polygons"][first_key][0].get("bounds")
+                        if bounds:
+                            minx, miny, maxx, maxy = bounds
+                            diag_dist, _ = get_distance_bearing(miny, minx, maxy, maxx)
+                            target_radius_m = diag_dist / 2
+
+                # --- AUTO-SCALING SWARM FORMATION ---
+                if d_obj.fov < 360:
+                    base_angle = d_obj.azimuth
+                    arc_spread = d_obj.fov * 0.60  # Uses 60% of camera vision cone
+                else:
+                    base_angle = random.uniform(0, 360)
+                    arc_spread = 90  # Keeps the tight 45-degree spearhead you liked
+                    
+                # Dynamically scales swarm depth to 15% of the sensor's absolute range
+                max_stagger_depth = max(10, d_obj.outerRange * 0.15) 
+
+                drones = []
+                for i in range(swarm_size):
+                    # Random spacing INSIDE the tight arc
+                    angle_offset = random.uniform(-arc_spread / 2, arc_spread / 2)
+                    drone_spawn_angle = (base_angle + angle_offset) % 360
+                    
+                    # Spawns them dynamically at the outer rim, staggered by the 15% depth
+                    chaotic_spawn_distance = d_obj.outerRange - random.uniform(0, max_stagger_depth)
+                    start_lat, start_lng = fast_destination(d_obj.lat, d_obj.lng, chaotic_spawn_distance, drone_spawn_angle)
+                    
+                    # Engulfs the perimeter dynamically (between 50% and 120% of the building's measured size)
+                    end_spread = random.uniform(target_radius_m * 0.5, target_radius_m * 1.2)
+                    end_angle = random.uniform(0, 360)
+                    end_lat, end_lng = fast_destination(target_lat, target_lng, end_spread, end_angle)
+                    
+                    drones.append({
+                        "track_id": 1001 + i,
+                        "start": (start_lat, start_lng),
+                        "end": (end_lat, end_lng),
+                        "speed": round(random.uniform(50, 90), 2),
+                        "height": round(random.uniform(50, 200), 2),
+                        "total_steps": packets_per_drone,
+                        "current_step": 0
+                    })
+                
+                task_pool.append({
+                    "dev": d_obj, "target": "SWARM", "remaining": dev_total, 
+                    "drones": drones, "current_drone_idx": 0
+                })
+            else:
+                allocated = 0
+                if kml_probs:
+                    for fname, prob in kml_probs.items():
+                        count = int(dev_total * float(prob))
+                        if count > 0:
+                            clean_target = str(fname).strip().upper()
+                            task_pool.append({"dev": d_obj, "target": clean_target, "remaining": count})
+                            allocated += count
+                            
+                remainder = dev_total - allocated
+                if remainder > 0:
+                    task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": remainder})
+
         with engine_lock:
-            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB START ERROR: {str(e)}", "type": "error"})
+            engine_state['is_running'] = True
+            engine_state['should_abort'] = False
+            engine_state['progress'] = 0
+            engine_state['total'] = total_alerts_requested
+            engine_state['logs'] = [{"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Engaging '{scenarioName}'. Swarm/Kinematics Active.", "type": "info"}]
+            engine_state['map_alerts'] = []
 
-    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ui_alerts = deque(maxlen=1000)
-    db_chunk = []
+        if total_alerts_requested == 0 or not task_pool:
+            return
 
-    for current_idx in range(total_alerts_requested):
-        with engine_lock:
-            if engine_state['should_abort']:
-                engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": "SYSTEM: Transmission Aborted manually.", "type": "error"})
-                break
+        schema_cache = {}
+        for s in schemas:
+            schema_cache[str(s.get('name', '')).upper()] = {
+                "schema": sorted(s.get('schema', []), key=lambda x: x.get('index', 0)),
+                "separator": str(s.get('separator', ','))
+            }
 
-        task_idx = random.randrange(len(task_pool))
-        current_task = task_pool[task_idx]
-        
-        d_obj = current_task["dev"]
-        target_assignment = current_task["target"]
+        db = SessionLocal()
+        run_id = None
+        try:
+            db_run = SimulationRun(
+                scenario_name=scenarioName, total_alerts=total_alerts_requested, 
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                devices_snapshot=json.dumps(active_devices + env_devices) 
+            )
+            db.add(db_run)
+            db.commit()
+            db.refresh(db_run)
+            run_id = db_run.id
+        except Exception as e:
+            with engine_lock:
+                engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB START ERROR: {str(e)}", "type": "error"})
 
-        alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, polygons, lines, target_assignment)
-        track_id = current_idx + 1
-        
-        alert_data = {
-            "run_id": run_id, "sensor_type": d_obj.clean_type, "sensor_name": d_obj.id,
-            "alert_id": track_id, "priority": priority, "latitude": alert_lat, "longitude": alert_lng,
-            "distance_m": dist, "bearing": bearing, "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        
-        ui_alerts.append(alert_data)
-        db_chunk.append(alert_data)
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ui_alerts = deque(maxlen=1000)
+        db_chunk = []
+        last_ui_update_time = 0
 
-        cache_entry = schema_cache.get(str(d_obj.packetChoice).upper())
-        sel_schema = cache_entry['schema'] if cache_entry else None
-        sel_sep = cache_entry['separator'] if cache_entry else ","
+        for current_idx in range(total_alerts_requested):
+            with engine_lock:
+                if engine_state['should_abort']:
+                    engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": "SYSTEM: Transmission Aborted manually.", "type": "error"})
+                    break
 
-        # PASSING THE DOMAIN MAPPING CORRECTLY HERE
-        packet_string = build_dynamic_packet(alert_data, d_obj, track_id, sel_schema, sel_sep, device_alert_mapping, device_domain_mapping)
-        
-        try: udp_socket.sendto(packet_string.encode('utf-8'), (str(udpIp), int(udpPort)))
-        except Exception: pass
+            task_idx = random.randrange(len(task_pool))
+            current_task = task_pool[task_idx]
+            
+            d_obj = current_task["dev"]
+            target_assignment = current_task["target"]
 
-        if len(db_chunk) >= 5000:
+            if target_assignment == "SWARM":
+                drone = current_task["drones"][current_task["current_drone_idx"]]
+                
+                # --- PURE KINEMATIC INTERPOLATION ---
+                fraction = drone["current_step"] / max(1, drone["total_steps"])
+                
+                # Pure smooth math
+                alert_lat = drone["start"][0] + (drone["end"][0] - drone["start"][0]) * fraction
+                alert_lng = drone["start"][1] + (drone["end"][1] - drone["start"][1]) * fraction
+                
+                dist, bearing = get_distance_bearing(d_obj.lat, d_obj.lng, alert_lat, alert_lng)
+                
+                track_id = drone["track_id"]
+                priority = determine_priority(dist)
+                
+                locked_height = drone["height"]
+                locked_speed = drone["speed"]
+                locked_elevation = round(math.degrees(math.atan2(locked_height, dist)), 2) if dist > 0 else 90.0
+                
+                drone["current_step"] += 1
+                current_task["current_drone_idx"] = (current_task["current_drone_idx"] + 1) % len(current_task["drones"])
+                
+                swarm_overrides = {
+                    "is_swarm": True,
+                    "height": locked_height,
+                    "speed": locked_speed,
+                    "elevation": locked_elevation
+                }
+            else:
+                alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, target_assignment, device_target_cache)
+                track_id = current_idx + 1
+                swarm_overrides = {"is_swarm": False}
+            
+            alert_data = {
+                "run_id": run_id, "sensor_type": d_obj.clean_type, "sensor_name": d_obj.id,
+                "alert_id": track_id, "priority": priority, "latitude": alert_lat, "longitude": alert_lng,
+                "distance_m": dist, "bearing": bearing, "timestamp": datetime.now(timezone.utc).isoformat(),
+                **swarm_overrides
+            }
+            
+            ui_alerts.append(alert_data)
+            db_chunk.append(alert_data)
+
+            cache_entry = schema_cache.get(str(d_obj.packetChoice).upper())
+            sel_schema = cache_entry['schema'] if cache_entry else None
+            sel_sep = cache_entry['separator'] if cache_entry else ","
+
+            packet_string = build_dynamic_packet(alert_data, d_obj, track_id, sel_schema, sel_sep, device_alert_mapping, device_domain_mapping)
+            
+            try: udp_socket.sendto(packet_string.encode('utf-8'), (str(udpIp), int(udpPort)))
+            except Exception: pass
+
+            if len(db_chunk) >= 5000:
+                db.bulk_insert_mappings(AlertLog, db_chunk)
+                db.commit()
+                db_chunk.clear()
+
+            current_time = time.time()
+            if (current_time - last_ui_update_time >= 0.25) or (current_idx == total_alerts_requested - 1):
+                with engine_lock:
+                    engine_state['progress'] = current_idx + 1
+                    engine_state['map_alerts'] = list(ui_alerts)
+                    engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"[{d_obj.id}] -> {packet_string}", "type": "success"})
+                    if len(engine_state['logs']) > 50:
+                        engine_state['logs'] = engine_state['logs'][:50]
+                last_ui_update_time = current_time
+
+            current_task["remaining"] -= 1
+            if current_task["remaining"] <= 0:
+                task_pool[task_idx] = task_pool[-1]
+                task_pool.pop()
+
+            delay = random.uniform(float(minDelay), float(maxDelay))
+            if delay > 0: time.sleep(delay)
+
+        udp_socket.close()
+        if db_chunk:
             db.bulk_insert_mappings(AlertLog, db_chunk)
             db.commit()
             db_chunk.clear()
 
-        if current_idx % 1 == 0 or current_idx == total_alerts_requested - 1:
+        if not engine_state['should_abort']:
             with engine_lock:
-                engine_state['progress'] = current_idx + 1
-                engine_state['map_alerts'] = list(ui_alerts)
-                engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"[{d_obj.id}] -> {packet_string}", "type": "success"})
-                if len(engine_state['logs']) > 50:
-                    engine_state['logs'] = engine_state['logs'][:50]
+                engine_state['progress'] = total_alerts_requested
+                engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Transmission Complete.", "type": "info"})
 
-        current_task["remaining"] -= 1
-        if current_task["remaining"] <= 0:
-            task_pool[task_idx] = task_pool[-1]
-            task_pool.pop()
+        db.close()
 
-        delay = random.uniform(float(minDelay), float(maxDelay))
-        if delay > 0: time.sleep(delay)
-
-    udp_socket.close()
-    if db_chunk:
-        db.bulk_insert_mappings(AlertLog, db_chunk)
-        db.commit()
-        db_chunk.clear()
-
-    if not engine_state['should_abort']:
+    except Exception as e:
+        print(f"\n[CRITICAL ENGINE FAULT]: {e}\n")
         with engine_lock:
-            engine_state['progress'] = total_alerts_requested
-            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"SYSTEM: Transmission Complete. {total_alerts_requested} packets sent and committed to DB.", "type": "info"})
-
-    db.close()
-    with engine_lock:
-        engine_state['is_running'] = False
+            engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"CRITICAL ENGINE FAULT: {str(e)}. Review terminal for details.", "type": "error"})
+            
+    finally:
+        with engine_lock:
+            engine_state['is_running'] = False
 
 
 # ==========================================================
@@ -565,7 +733,9 @@ def api_engine_start(payload: dict):
             payload["activeDevices"], payload["environmentDevices"], payload["sensorSchemas"],
             payload["alertConfig"]["minDelaySec"], payload["alertConfig"]["maxDelaySec"],
             payload.get("kmlProbabilities", {}), payload.get("deviceAlertMapping", {}),
-            payload.get("deviceDomainMapping", {})  # PASSING THE DOMAIN MAPPING CORRECTLY HERE
+            payload.get("deviceDomainMapping", {}),
+            payload.get("deviceSwarmMode", {}),  # <-- ADD THIS
+            payload.get("deviceSwarmSize", {})
         ),
         daemon=True
     )
@@ -767,7 +937,6 @@ def delete_schema(schema_name: str, db: Session = Depends(get_db)):
 def get_scenario_state(workspace_name: str, db: Session = Depends(get_db)):
     s = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == workspace_name).first()
     if s: 
-        # Safely extract dynamic columns using getattr in case DB wasn't updated via raw SQL
         return { 
             "name": s.name, 
             "activeDevices": json.loads(s.activeDevices) if s.activeDevices else [], 
@@ -797,7 +966,6 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
         s.udpPort = payload.udpPort
         s.workspace = target_workspace
         s.kmlProbabilities = prob_str
-        # Directly writing using raw SQL to bypass SQLAlchemy strict column mapping limitations
         db.execute(text("UPDATE scenario_state SET devicealertmapping = :am, devicedomainmapping = :dm WHERE id = :id"), {"am": map_str, "dm": domain_str, "id": target_workspace})
     else:
         new_s = ScenarioStateDB(

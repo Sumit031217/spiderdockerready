@@ -856,6 +856,40 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                                   <option value="BOTH">Mixed (Both)</option>
                               </select>
                           </div>
+                          {/* --- NEW SWARM TOGGLES --- */}
+    {(scenario?.deviceDomainMapping?.[dev.id] === 'AIRBORNE' || scenario?.deviceDomainMapping?.[dev.id] === 'BOTH') && (
+        <div className="mt-2 p-2 bg-slate-800/50 rounded border border-slate-700/50 flex flex-col space-y-2">
+            <div className="flex items-center justify-between">
+                <span className="text-[10px] font-mono text-indigo-300 uppercase tracking-wider">Flight Mode</span>
+                <select
+                    value={scenario?.deviceSwarmMode?.[dev.id] ? 'SWARM' : 'NORMAL'}
+                    onChange={(e) => setScenario(prev => ({
+                        ...prev, 
+                        deviceSwarmMode: { ...(prev.deviceSwarmMode || {}), [dev.id]: e.target.value === 'SWARM' }
+                    }))}
+                    className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[10px] text-white focus:outline-none cursor-pointer w-[100px]"
+                >
+                    <option value="NORMAL">Random</option>
+                    <option value="SWARM">Intruder Swarm</option>
+                </select>
+            </div>
+            {scenario?.deviceSwarmMode?.[dev.id] && (
+                <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-mono text-indigo-300 uppercase tracking-wider">Swarm Size</span>
+                    <input 
+                        type="number" min="1" max="200"
+                        value={scenario?.deviceSwarmSize?.[dev.id] || 5}
+                        onChange={(e) => setScenario(prev => ({
+                            ...prev, 
+                            deviceSwarmSize: { ...(prev.deviceSwarmSize || {}), [dev.id]: parseInt(e.target.value, 10) || 5 }
+                        }))}
+                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[10px] text-white w-[100px] text-right"
+                    />
+                </div>
+            )}
+        </div>
+    )}
+    {/* ------------------------- */}
                       </div>
                   )}
 
@@ -1507,7 +1541,10 @@ export default function App() {
         alertConfig: alertConfig,
         sensorSchemas: Array.isArray(sensorSchemas) ? sensorSchemas : [],
         kmlProbabilities: scenario?.kmlProbabilities || {},
-        deviceAlertMapping: scenario?.deviceAlertMapping || {}
+        deviceAlertMapping: scenario?.deviceAlertMapping || {},
+        deviceDomainMapping: scenario?.deviceDomainMapping || {},
+        deviceSwarmMode: scenario?.deviceSwarmMode || {},
+        deviceSwarmSize: scenario?.deviceSwarmSize || {} 
     };
 
     try {
