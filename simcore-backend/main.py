@@ -50,6 +50,8 @@ try:
         except: pass
         try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN deviceswarmsize TEXT DEFAULT '{}';"))
         except: pass
+        try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN deviceswarmarc TEXT DEFAULT '{}';"))
+        except: pass
 except Exception as e:
     print("\nWARNING: Could not connect to PostgreSQL Database:", e)
 
@@ -116,6 +118,10 @@ class ScenarioModel(BaseModel):
     deviceDomainMapping: Optional[dict] = {}
     deviceSwarmMode: Optional[dict] = {}
     deviceSwarmSize: Optional[dict] = {}
+    deviceSwarmArc: Optional[dict] = {}
+    deviceSwarmMode: Optional[dict] = {}
+    deviceSwarmSize: Optional[dict] = {}
+    deviceSwarmArc: Optional[dict] = {}
 
 class RangeExportRequest(BaseModel):
     startTime: str
@@ -420,7 +426,7 @@ class OptimizedDevice:
         self.polygon = d.get('polygon', [])
         self.packetChoice = d.get('packetChoice', '')
 
-def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping, device_swarm_mode, device_swarm_size):
+def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping, device_swarm_mode, device_swarm_size, device_swarm_arc):
     global engine_state
     
     try:
@@ -481,12 +487,14 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                             target_radius_m = diag_dist / 2
 
                 # --- AUTO-SCALING SWARM FORMATION ---
-                if d_obj.fov < 360:
-                    base_angle = d_obj.azimuth
-                    arc_spread = d_obj.fov * 0.60  # Uses 60% of camera vision cone
+                base_angle = d_obj.azimuth if d_obj.fov < 360 else random.uniform(0, 360)
+                
+                # Check if user explicitly set an arc, otherwise fallback to defaults
+                custom_arc = device_swarm_arc.get(d_obj.id)
+                if custom_arc is not None:
+                    arc_spread = float(custom_arc)
                 else:
-                    base_angle = random.uniform(0, 360)
-                    arc_spread = 90  # Keeps the tight 45-degree spearhead you liked
+                    arc_spread = (d_obj.fov * 0.60) if d_obj.fov < 360 else 90.0
                     
                 # Dynamically scales swarm depth to 15% of the sensor's absolute range
                 max_stagger_depth = max(10, d_obj.outerRange * 0.15) 
@@ -735,7 +743,8 @@ def api_engine_start(payload: dict):
             payload.get("kmlProbabilities", {}), payload.get("deviceAlertMapping", {}),
             payload.get("deviceDomainMapping", {}),
             payload.get("deviceSwarmMode", {}),  # <-- ADD THIS
-            payload.get("deviceSwarmSize", {})
+            payload.get("deviceSwarmSize", {}),
+            payload.get("deviceSwarmArc", {})
         ),
         daemon=True
     )
@@ -945,19 +954,43 @@ def get_scenario_state(workspace_name: str, db: Session = Depends(get_db)):
             "workspace": s.workspace,
             "kmlProbabilities": json.loads(s.kmlProbabilities) if s.kmlProbabilities else {},
             "deviceAlertMapping": json.loads(getattr(s, 'devicealertmapping', '{}')) if getattr(s, 'devicealertmapping', None) else {},
-            "deviceDomainMapping": json.loads(getattr(s, 'devicedomainmapping', '{}')) if getattr(s, 'devicedomainmapping', None) else {}
+            "deviceDomainMapping": json.loads(getattr(s, 'devicedomainmapping', '{}')) if getattr(s, 'devicedomainmapping', None) else {},
+            # --- NEW SWARM CONTROLS ---
+            "deviceSwarmMode": json.loads(getattr(s, 'deviceswarmmode', '{}')) if getattr(s, 'deviceswarmmode', None) else {},
+            "deviceSwarmSize": json.loads(getattr(s, 'deviceswarmsize', '{}')) if getattr(s, 'deviceswarmsize', None) else {},
+            "deviceSwarmArc": json.loads(getattr(s, 'deviceswarmarc', '{}')) if getattr(s, 'deviceswarmarc', None) else {}
         }
-    return { "name": f"{workspace_name} Mission", "activeDevices": [], "udpIp": "127.0.0.1", "udpPort": 5005, "workspace": workspace_name, "kmlProbabilities": {}, "deviceAlertMapping": {}, "deviceDomainMapping": {} }
+    
+    # Fallback if no scenario exists for this workspace yet
+    return { 
+        "name": f"{workspace_name} Mission", 
+        "activeDevices": [], 
+        "udpIp": "127.0.0.1", 
+        "udpPort": 5005, 
+        "workspace": workspace_name, 
+        "kmlProbabilities": {}, 
+        "deviceAlertMapping": {}, 
+        "deviceDomainMapping": {},
+        "deviceSwarmMode": {},
+        "deviceSwarmSize": {},
+        "deviceSwarmArc": {}
+    }
+
 
 @app.post("/api/state/scenario")
 def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
-    target_workspace = str(payload.workspace or "Default")
+    target_workspace = payload.workspace or "Default"
     s = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == target_workspace).first()
     
     dev_str = json.dumps(payload.activeDevices)
     prob_str = json.dumps(payload.kmlProbabilities) if payload.kmlProbabilities else "{}"
     map_str = json.dumps(payload.deviceAlertMapping) if getattr(payload, 'deviceAlertMapping', None) else "{}"
     domain_str = json.dumps(payload.deviceDomainMapping) if getattr(payload, 'deviceDomainMapping', None) else "{}"
+    
+    # Serialize Swarm Parameters
+    swarm_mode_str = json.dumps(getattr(payload, 'deviceSwarmMode', {}) or {})
+    swarm_size_str = json.dumps(getattr(payload, 'deviceSwarmSize', {}) or {})
+    swarm_arc_str = json.dumps(getattr(payload, 'deviceSwarmArc', {}) or {})
     
     if s:
         s.name = payload.name
@@ -966,7 +999,26 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
         s.udpPort = payload.udpPort
         s.workspace = target_workspace
         s.kmlProbabilities = prob_str
-        db.execute(text("UPDATE scenario_state SET devicealertmapping = :am, devicedomainmapping = :dm WHERE id = :id"), {"am": map_str, "dm": domain_str, "id": target_workspace})
+        
+        db.execute(
+            text("""
+                UPDATE scenario_state 
+                SET devicealertmapping = :am, 
+                    devicedomainmapping = :dm,
+                    deviceswarmmode = :sm,
+                    deviceswarmsize = :ss,
+                    deviceswarmarc = :sa
+                WHERE id = :id
+            """), 
+            {
+                "am": map_str, 
+                "dm": domain_str, 
+                "sm": swarm_mode_str,
+                "ss": swarm_size_str,
+                "sa": swarm_arc_str,
+                "id": target_workspace
+            }
+        )
     else:
         new_s = ScenarioStateDB(
             id=target_workspace, 
@@ -978,8 +1030,27 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
             kmlProbabilities=prob_str
         )
         db.add(new_s)
-        db.commit()
-        db.execute(text("UPDATE scenario_state SET devicealertmapping = :am, devicedomainmapping = :dm WHERE id = :id"), {"am": map_str, "dm": domain_str, "id": target_workspace})
-    
+        db.flush()
+        
+        db.execute(
+            text("""
+                UPDATE scenario_state 
+                SET devicealertmapping = :am, 
+                    devicedomainmapping = :dm,
+                    deviceswarmmode = :sm,
+                    deviceswarmsize = :ss,
+                    deviceswarmarc = :sa
+                WHERE id = :id
+            """), 
+            {
+                "am": map_str, 
+                "dm": domain_str, 
+                "sm": swarm_mode_str,
+                "ss": swarm_size_str,
+                "sa": swarm_arc_str,
+                "id": target_workspace
+            }
+        )
+        
     db.commit()
-    return {"status": "success"}
+    return {"status": "success", "workspace": target_workspace}
