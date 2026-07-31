@@ -72,6 +72,9 @@ class SchemaConfigDB(Base):
 # ==========================================
 # LIVE STATE PERSISTENCE TABLES
 # ==========================================
+# ==========================================
+# LIVE STATE PERSISTENCE TABLES
+# ==========================================
 class ScenarioStateDB(Base):
     __tablename__ = "scenario_state"
     id = Column(String, primary_key=True, index=True) 
@@ -86,6 +89,12 @@ class ScenarioStateDB(Base):
     # Kept explicit lowercase mapping ONLY for the newly injected columns
     kmlProbabilities = Column("kmlprobabilities", Text, default="{}") 
     deviceAlertMapping = Column("devicealertmapping", Text, default="{}") 
+    
+    # --- NEW: REGISTERED SWARM & KINEMATIC COLUMNS ---
+    deviceDomainMapping = Column("devicedomainmapping", Text, default="{}")
+    deviceSwarmMode = Column("deviceswarmmode", Text, default="{}")
+    deviceSwarmSize = Column("deviceswarmsize", Text, default="{}")
+    deviceSwarmArc = Column("deviceswarmarc", Text, default="{}")
 
 class ActiveAlertDB(Base):
     __tablename__ = "active_alerts"

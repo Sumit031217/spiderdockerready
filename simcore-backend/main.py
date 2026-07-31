@@ -108,6 +108,7 @@ class SensorEventUploadModel(BaseModel):
     fields: List[SensorEventFieldModel]    
 
 class ScenarioModel(BaseModel):
+    id: Optional[str] = None
     name: str
     activeDevices: list
     udpIp: str
@@ -116,9 +117,6 @@ class ScenarioModel(BaseModel):
     kmlProbabilities: Optional[dict] = {}
     deviceAlertMapping: Optional[dict] = {}
     deviceDomainMapping: Optional[dict] = {}
-    deviceSwarmMode: Optional[dict] = {}
-    deviceSwarmSize: Optional[dict] = {}
-    deviceSwarmArc: Optional[dict] = {}
     deviceSwarmMode: Optional[dict] = {}
     deviceSwarmSize: Optional[dict] = {}
     deviceSwarmArc: Optional[dict] = {}
@@ -439,10 +437,14 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
             if total_prob_sum > 1.0:
                 kml_probs = {k: (float(v) / total_prob_sum) for k, v in kml_probs.items()}
 
+        # CRITICAL FIX: De-duplicate incoming payload by Device ID to prevent overlapping scenarios
+        unique_active_devices = {d.get("id"): d for d in active_devices}.values()
+
         task_pool = []
         total_alerts_requested = 0
+        swarm_track_counter = 10000000  # 10 Million buffer to allow massive generation without collisions
 
-        for dev_dict in active_devices:
+        for dev_dict in unique_active_devices:
             dev_total = int(dev_dict.get('alertCount', 0))
             if dev_total <= 0: continue
             total_alerts_requested += dev_total
@@ -515,7 +517,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                     end_lat, end_lng = fast_destination(target_lat, target_lng, end_spread, end_angle)
                     
                     drones.append({
-                        "track_id": 1001 + i,
+                        "track_id": swarm_track_counter,
                         "start": (start_lat, start_lng),
                         "end": (end_lat, end_lng),
                         "speed": round(random.uniform(50, 90), 2),
@@ -523,6 +525,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                         "total_steps": packets_per_drone,
                         "current_step": 0
                     })
+                    swarm_track_counter += 1
                 
                 task_pool.append({
                     "dev": d_obj, "target": "SWARM", "remaining": dev_total, 
@@ -976,81 +979,77 @@ def get_scenario_state(workspace_name: str, db: Session = Depends(get_db)):
         "deviceSwarmArc": {}
     }
 
-
 @app.post("/api/state/scenario")
 def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
+    import uuid
     target_workspace = payload.workspace or "Default"
-    s = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == target_workspace).first()
     
-    dev_str = json.dumps(payload.activeDevices)
+    dev_str = json.dumps(payload.activeDevices) if payload.activeDevices else "[]"
     prob_str = json.dumps(payload.kmlProbabilities) if payload.kmlProbabilities else "{}"
-    map_str = json.dumps(payload.deviceAlertMapping) if getattr(payload, 'deviceAlertMapping', None) else "{}"
-    domain_str = json.dumps(payload.deviceDomainMapping) if getattr(payload, 'deviceDomainMapping', None) else "{}"
-    
-    # Serialize Swarm Parameters
+    map_str = json.dumps(getattr(payload, 'deviceAlertMapping', {}) or {})
+    domain_str = json.dumps(getattr(payload, 'deviceDomainMapping', {}) or {})
     swarm_mode_str = json.dumps(getattr(payload, 'deviceSwarmMode', {}) or {})
     swarm_size_str = json.dumps(getattr(payload, 'deviceSwarmSize', {}) or {})
     swarm_arc_str = json.dumps(getattr(payload, 'deviceSwarmArc', {}) or {})
+
+    # OPTIMIZATION: Only query the DB if we already have an ID (Updating)
+    if payload.id:
+        existing = db.query(ScenarioStateDB).filter(ScenarioStateDB.id == payload.id).first()
+        if existing:
+            existing.name = payload.name
+            existing.activeDevices = dev_str
+            existing.udpIp = payload.udpIp
+            existing.udpPort = payload.udpPort
+            existing.workspace = target_workspace
+            existing.kmlProbabilities = prob_str
+            existing.deviceAlertMapping = map_str
+            existing.deviceDomainMapping = domain_str
+            existing.deviceSwarmMode = swarm_mode_str
+            existing.deviceSwarmSize = swarm_size_str
+            existing.deviceSwarmArc = swarm_arc_str
+            db.commit()
+            return {"status": "success", "id": payload.id}
     
-    if s:
-        s.name = payload.name
-        s.activeDevices = dev_str
-        s.udpIp = payload.udpIp
-        s.udpPort = payload.udpPort
-        s.workspace = target_workspace
-        s.kmlProbabilities = prob_str
-        
-        db.execute(
-            text("""
-                UPDATE scenario_state 
-                SET devicealertmapping = :am, 
-                    devicedomainmapping = :dm,
-                    deviceswarmmode = :sm,
-                    deviceswarmsize = :ss,
-                    deviceswarmarc = :sa
-                WHERE id = :id
-            """), 
-            {
-                "am": map_str, 
-                "dm": domain_str, 
-                "sm": swarm_mode_str,
-                "ss": swarm_size_str,
-                "sa": swarm_arc_str,
-                "id": target_workspace
-            }
-        )
-    else:
-        new_s = ScenarioStateDB(
-            id=target_workspace, 
-            name=payload.name, 
-            activeDevices=dev_str, 
-            udpIp=payload.udpIp, 
-            udpPort=payload.udpPort, 
-            workspace=target_workspace,
-            kmlProbabilities=prob_str
-        )
-        db.add(new_s)
-        db.flush()
-        
-        db.execute(
-            text("""
-                UPDATE scenario_state 
-                SET devicealertmapping = :am, 
-                    devicedomainmapping = :dm,
-                    deviceswarmmode = :sm,
-                    deviceswarmsize = :ss,
-                    deviceswarmarc = :sa
-                WHERE id = :id
-            """), 
-            {
-                "am": map_str, 
-                "dm": domain_str, 
-                "sm": swarm_mode_str,
-                "ss": swarm_size_str,
-                "sa": swarm_arc_str,
-                "id": target_workspace
-            }
-        )
-        
+    # OPTIMIZATION: Instantly inject new drafts without scanning the DB first
+    new_id = payload.id if payload.id else str(uuid.uuid4())
+    new_s = ScenarioStateDB(
+        id=new_id, 
+        name=payload.name, 
+        activeDevices=dev_str, 
+        udpIp=payload.udpIp, 
+        udpPort=payload.udpPort, 
+        workspace=target_workspace,
+        kmlProbabilities=prob_str,
+        deviceAlertMapping=map_str,
+        deviceDomainMapping=domain_str,
+        deviceSwarmMode=swarm_mode_str,
+        deviceSwarmSize=swarm_size_str,
+        deviceSwarmArc=swarm_arc_str
+    )
+    db.add(new_s)
     db.commit()
-    return {"status": "success", "workspace": target_workspace}
+    
+    return {"status": "success", "id": new_id}
+
+@app.get("/api/state/scenarios/{workspace}")
+def get_workspace_scenarios(workspace: str, db: Session = Depends(get_db)):
+    scenarios = db.query(ScenarioStateDB).filter(ScenarioStateDB.workspace == workspace).all()
+    res = []
+    for s in scenarios:
+        res.append({
+            "id": s.id,
+            "name": s.name,
+            "workspace": s.workspace,
+            "activeDevices": json.loads(s.activeDevices) if s.activeDevices else [],
+            "udpIp": s.udpIp,
+            "udpPort": s.udpPort,
+            "kmlProbabilities": json.loads(s.kmlProbabilities) if s.kmlProbabilities else {},
+            
+            # --- THE FIX: We can now fetch these naturally because database.py knows they exist ---
+            "deviceAlertMapping": json.loads(s.deviceAlertMapping) if s.deviceAlertMapping else {},
+            "deviceDomainMapping": json.loads(s.deviceDomainMapping) if s.deviceDomainMapping else {},
+            "deviceSwarmMode": json.loads(s.deviceSwarmMode) if s.deviceSwarmMode else {},
+            "deviceSwarmSize": json.loads(s.deviceSwarmSize) if s.deviceSwarmSize else {},
+            "deviceSwarmArc": json.loads(s.deviceSwarmArc) if s.deviceSwarmArc else {}
+        })
+    return res
