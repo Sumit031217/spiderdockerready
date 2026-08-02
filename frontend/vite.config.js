@@ -9,6 +9,7 @@ export default defineConfig({
     react(),
   ],
   server: {
+    host: true, // <--- THIS FORCES VITE TO BROADCAST TO YOUR LAN
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8000',

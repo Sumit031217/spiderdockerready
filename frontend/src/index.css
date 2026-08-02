@@ -1,1 +1,49 @@
 @import "tailwindcss";
+
+/* Forces Tailwind v4 to use the .dark class for dark mode toggling */
+@custom-variant dark (&:is(.dark *));
+
+/* --- SIMCORE LIGHT & DARK MODE THEME VARIABLES --- */
+@layer base {
+  :root {
+    /* LIGHT MODE (Professional Beige/Slate) */
+    --background: #fdfbf7;
+    --surface: #ffffff;
+    --surface-hover: #f3f1ec;
+    --border: #e2dfd5;
+    
+    --text-main: #1e293b;
+    --text-muted: #64748b;
+    
+    --accent-primary: #0f172a; 
+    --accent-primary-hover: #1e293b;
+    
+    --accent-secondary: #0ea5e9; 
+    --accent-success: #10b981; 
+    --accent-danger: #ef4444; 
+    --accent-warning: #f59e0b; 
+    
+    --map-overlay: rgba(255, 255, 255, 0.9);
+  }
+
+  .dark {
+    /* DARK MODE (Tactical Dark Gray/Navy) */
+    --background: #0f172a;
+    --surface: #1e293b;
+    --surface-hover: #334155;
+    --border: #334155;
+    
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+    
+    --accent-primary: #3b82f6; 
+    --accent-primary-hover: #2563eb;
+    
+    --accent-secondary: #38bdf8;
+    --accent-success: #3b836b;
+    --accent-danger: #ef4444;
+    --accent-warning: #f59e0b;
+    
+    --map-overlay: rgba(15, 23, 42, 0.9);
+  }
+}
