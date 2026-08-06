@@ -1423,7 +1423,17 @@ export default function App() {
           }
       }).catch(e => console.error(e));
   };
-
+  // Fetch all saved workspaces from the database on initial load
+  useEffect(() => {
+    fetch('/api/workspaces')
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success' && Array.isArray(data.workspaces)) {
+          setAllWorkspaces(data.workspaces);
+        }
+      })
+      .catch(err => console.error("Failed to load workspaces:", err));
+  }, []);
   useEffect(() => {
       fetchWorkspaceScenarios();
       const handleSaveEvent = () => fetchWorkspaceScenarios();

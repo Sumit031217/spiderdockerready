@@ -1030,7 +1030,19 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
     db.commit()
     
     return {"status": "success", "id": new_id}
-
+@app.get("/api/workspaces")
+def get_all_workspaces(db: Session = Depends(get_db)):
+    try:
+        # Ask PostgreSQL for all unique workspace names currently saved in scenarios
+        scenario_ws = [row[0] for row in db.query(ScenarioStateDB.workspace).distinct().all() if row[0]]
+        
+        # Deduplicate and ensure 'Default' is always in the list
+        unique_workspaces = list(set(["Default"] + scenario_ws))
+        
+        return {"status": "success", "workspaces": unique_workspaces}
+    except Exception as e:
+        print(f"Error fetching workspaces: {e}")
+        return {"status": "error", "workspaces": ["Default"]}
 @app.get("/api/state/scenarios/{workspace}")
 def get_workspace_scenarios(workspace: str, db: Session = Depends(get_db)):
     scenarios = db.query(ScenarioStateDB).filter(ScenarioStateDB.workspace == workspace).all()
