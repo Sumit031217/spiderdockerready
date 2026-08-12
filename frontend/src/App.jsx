@@ -35,16 +35,39 @@ const getDirectionalFovPolygon = (lat, lng, radiusMeters = 100, azimuth = 0, fov
   return points.length > 0 ? points : [];
 };
 
+// NEW: Custom Diamond Icon for Configured Sensors
+const sensorMarkerIcon = new L.divIcon({
+  className: '', // Drops default Leaflet white box styling
+  html: `<div style="width: 14px; height: 14px; background-color: #0f172a; border: 2.5px solid #00e5ff; transform: rotate(45deg); box-shadow: 0 0 6px #00e5ff;"></div>`,
+  iconSize: [14, 14],
+  iconAnchor: [7, 7]
+});
+// ==========================================
+// TACTICAL COLOR ENGINE (15-Color Pool)
+// ==========================================
+const TACTICAL_PALETTE = [
+  '#00e5ff', '#ef4444', '#facc15', '#22c55e', '#f97316', 
+  '#14b8a6', '#3b82f6', '#84cc16', '#10b981', '#eab308', 
+  '#06b6d4', '#ea580c', '#dc2626', '#0284c7', '#65a30d'
+];
+
+const getSensorColor = (id) => {
+  if (!id) return TACTICAL_PALETTE[0];
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) {
+    hash = String(id).charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return TACTICAL_PALETTE[Math.abs(hash) % TACTICAL_PALETTE.length];
+};
 // ==========================================
 // OPTIMIZATION: MEMOIZED MAP LAYERS
-// ==========================================
+
 const StaticEnvironmentLayer = React.memo(({ visibleDevices }) => {
   return (
     <>
       {(visibleDevices || []).map((dev, idx) => {
         if (!dev || !dev.type) return null;
         
-        // MATHEMATICALLY SAFE: Cast to String before checking
         const isEnv = String(dev.type || '').toUpperCase().includes('ENV');
         const isPids = String(dev.type || '').toUpperCase().includes('PIDS');
         
@@ -59,6 +82,9 @@ const StaticEnvironmentLayer = React.memo(({ visibleDevices }) => {
         const safePoly = Array.isArray(dev.polygon) ? dev.polygon : [];
         const isLine = ['ROAD', 'RAILWAY'].includes(dev.envCategory);
         
+        // Grab the assigned color for this specific sensor
+        const devColor = getSensorColor(dev.id);
+
         return (
           <React.Fragment key={dev.id || `dev-${idx}`}>
             {isEnv && dev.isPolygon && safePoly.length > 0 && (
@@ -94,10 +120,14 @@ const StaticEnvironmentLayer = React.memo(({ visibleDevices }) => {
               </>
             )}
 
+            {/* OPTION 3: The Radar Ping (Dynamically Colored) */}
             {!dev.isPolygon && !isEnv && dev.lat != null && dev.lng != null && (
-              <CircleMarker center={[dev.lat, dev.lng]} radius={isMicroSensor ? 4 : 5} pathOptions={{ color: '#0f172a', fillColor: isMicroSensor ? '#a855f7' : (isDirectional ? '#eab308' : '#ef4444'), fillOpacity: 1, weight: 2 }}>
-                  <Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{dev.id}</strong>Type: {dev.type}</Popup>
-              </CircleMarker>
+              <>
+                <CircleMarker center={[dev.lat, dev.lng]} radius={isMicroSensor ? 8 : 12} pathOptions={{ color: devColor, fillColor: devColor, fillOpacity: 0.15, weight: 1 }} />
+                <CircleMarker center={[dev.lat, dev.lng]} radius={2} pathOptions={{ color: '#0f172a', fillColor: devColor, fillOpacity: 1, weight: 1.5 }}>
+                    <Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{dev.id}</strong>Type: {dev.type}</Popup>
+                </CircleMarker>
+              </>
             )}
           </React.Fragment>
         );
@@ -107,19 +137,6 @@ const StaticEnvironmentLayer = React.memo(({ visibleDevices }) => {
 });
 
 const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices, scenario }) => {
-  const colorMap = useMemo(() => {
-    const cmap = {};
-    (mapDevices || []).forEach(d => {
-       if (!d) return;
-       const outerRange = parseFloat(d.outerRange || 100);
-       const fov = parseFloat(d.fov || 360);
-       const isMicro = outerRange <= 2.0;
-       const isDir = fov < 360;
-       cmap[d.id] = isMicro ? '#a855f7' : (isDir ? '#facc15' : '#ef4444');
-    });
-    return cmap;
-  }, [mapDevices]);
-
   return (
     <>
       {(displayedAlerts || []).map((alert, idx) => {
@@ -130,12 +147,10 @@ const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices, scenario }) =
          
          const sensorId = String(alert.sensor_name || alert.id || '');
          
-         let pinColor = colorMap[sensorId] || '#22c55e';
-         if (!colorMap[sensorId] && String(alert.sensor_type || '').toUpperCase().includes('PIDS')) {
-             pinColor = '#facc15';
-         }
+         // 1. Assign consistent color from the 15-color pool based on Sensor ID
+         let pinColor = getSensorColor(sensorId);
          
-         // OVERRIDE COLOR FOR AIRBORNE (NAVY BLUE)
+         // 2. OVERRIDE COLOR FOR AIRBORNE (NAVY BLUE)
          const domain = scenario?.deviceDomainMapping?.[sensorId] || scenario?.deviceDomainMapping?.[sensorId.toUpperCase()];
          if (domain === 'AIRBORNE' || domain === 'BOTH') pinColor = '#1e3a8a';
          
