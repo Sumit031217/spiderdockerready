@@ -95,6 +95,7 @@ class ScenarioStateDB(Base):
     deviceSwarmMode = Column("deviceswarmmode", Text, default="{}")
     deviceSwarmSize = Column("deviceswarmsize", Text, default="{}")
     deviceSwarmArc = Column("deviceswarmarc", Text, default="{}")
+    deviceGroundMode = Column("devicegroundmode", Text, default="{}")
 
 class ActiveAlertDB(Base):
     __tablename__ = "active_alerts"

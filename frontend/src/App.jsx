@@ -137,6 +137,9 @@ const StaticEnvironmentLayer = React.memo(({ visibleDevices }) => {
 });
 
 const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices, scenario }) => {
+  // ADDED: Track which alert is being hovered by the user
+  const [hoveredTrackId, setHoveredTrackId] = useState(null);
+
   return (
     <>
       {(displayedAlerts || []).map((alert, idx) => {
@@ -146,6 +149,7 @@ const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices, scenario }) =
          if (lat == null || lng == null) return null;
          
          const sensorId = String(alert.sensor_name || alert.id || '');
+         const trackId = String(alert.alert_id || alert.id || 'N/A');
          
          // 1. Assign consistent color from the 15-color pool based on Sensor ID
          let pinColor = getSensorColor(sensorId);
@@ -154,10 +158,30 @@ const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices, scenario }) =
          const domain = scenario?.deviceDomainMapping?.[sensorId] || scenario?.deviceDomainMapping?.[sensorId.toUpperCase()];
          if (domain === 'AIRBORNE' || domain === 'BOTH') pinColor = '#1e3a8a';
          
+         const isHovered = hoveredTrackId === trackId;
+
          return (
-             <CircleMarker key={`alert-${alert.alert_id || alert.id || idx}`} center={[lat, lng]} radius={5} pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}>
-                 <Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{alert.sensor_type || 'UNKNOWN'} ALERT</strong>Track ID: {alert.alert_id || alert.id || 'N/A'}</Popup>
-             </CircleMarker>
+             <React.Fragment key={`alert-group-${trackId}-${idx}`}>
+                 {/* ADDED: Conditionally render the dotted historical track line if hovered */}
+                 {isHovered && alert.full_track_history && alert.full_track_history.length > 1 && (
+                     <LeafletPolyline
+                         positions={alert.full_track_history}
+                         pathOptions={{ color: pinColor, weight: 2, dashArray: '5, 5', opacity: 0.6 }}
+                     />
+                 )}
+
+                 <CircleMarker 
+                     center={[lat, lng]} 
+                     radius={5} 
+                     pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}
+                     eventHandlers={{
+                         mouseover: () => setHoveredTrackId(trackId),
+                         mouseout: () => setHoveredTrackId(null)
+                     }}
+                 >
+                     <Popup className="font-mono text-xs"><strong className="block text-sm mb-1">{alert.sensor_type || 'UNKNOWN'} ALERT</strong>Track ID: {trackId}</Popup>
+                 </CircleMarker>
+             </React.Fragment>
          );
       })}
     </>
@@ -946,8 +970,12 @@ const AlertGeneratorView = ({
   const targetTotalAlerts = useMemo(() => (activeFleet || []).reduce((acc, dev) => acc + getAlertCount(dev), 0), [activeFleet, overrideCounts]);
 
   const handleChange = (e) => {
-    const { name, value } = e.target;
-    setAlertConfig(prev => ({ ...prev, [name]: parseFloat(value) }));
+    const { name, value, type, checked } = e.target;
+    setAlertConfig(prev => ({ 
+        ...prev, 
+        // EDGE CASE FIX: Safely extract boolean for checkboxes, otherwise parse as float
+        [name]: type === 'checkbox' ? checked : parseFloat(value) 
+    }));
   };
 
   const handleCountOverride = (devId, val) => {
@@ -1010,11 +1038,35 @@ const AlertGeneratorView = ({
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm">
             <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-5 flex items-center border-b border-slate-800 pb-2"><Sliders className="w-4 h-4 mr-2 text-cyan-400"/> Transmission Parameters</h3>
             <div className="space-y-4 mb-6">
-              <div>
+              {/* NEW: Synchronous Batch Mode Toggle */}
+              <div className="bg-slate-950 border border-slate-800 p-3 rounded flex flex-col space-y-3">
+                  <label className="flex items-center justify-between cursor-pointer">
+                      <span className="text-xs font-mono text-cyan-400 uppercase tracking-wider font-bold flex items-center">
+                          <Layers className="w-3 h-3 mr-2" /> Synchronous Heap Transmission
+                      </span>
+                      <input type="checkbox" name="enableBatchMode" checked={alertConfig?.enableBatchMode || false} onChange={handleChange} disabled={simIsRunning} className="w-4 h-4 accent-cyan-500 cursor-pointer" />
+                  </label>
+                  
+                  {alertConfig?.enableBatchMode && (
+                      <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-800">
+                          <div>
+                              <label className="block text-[10px] font-mono text-slate-500 mb-1 uppercase">Heap Size (Packets)</label>
+                              <input type="number" min="1" step="1" name="batchSize" value={alertConfig?.batchSize || 50} onChange={handleChange} disabled={simIsRunning} className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-cyan-400 font-mono text-sm focus:border-cyan-500 outline-none disabled:opacity-50" />
+                          </div>
+                          <div>
+                              <label className="block text-[10px] font-mono text-slate-500 mb-1 uppercase">Interval (Seconds)</label>
+                              <input type="number" min="0" step="0.1" name="batchIntervalSec" value={alertConfig?.batchIntervalSec || 5.0} onChange={handleChange} disabled={simIsRunning} className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-cyan-400 font-mono text-sm focus:border-cyan-500 outline-none disabled:opacity-50" />
+                          </div>
+                      </div>
+                  )}
+              </div>
+
+              {/* EXISTING: Timing Physics (Visually disabled if Batch Mode is active) */}
+              <div className={alertConfig?.enableBatchMode ? 'opacity-40 pointer-events-none transition-opacity' : 'transition-opacity'}>
                 <label className="block text-xs font-mono text-slate-500 mb-1 flex items-center"><Clock className="w-3 h-3 mr-1 text-amber-400"/> Timing Physics (Seconds)</label>
                 <div className="grid grid-cols-2 gap-3">
-                  <input type="number" step="0.0001" name="minDelaySec" value={alertConfig?.minDelaySec || 0} onChange={handleChange} disabled={simIsRunning} placeholder="Min" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
-                  <input type="number" step="0.0001" name="maxDelaySec" value={alertConfig?.maxDelaySec || 0} onChange={handleChange} disabled={simIsRunning} placeholder="Max" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
+                  <input type="number" step="0.0001" name="minDelaySec" value={alertConfig?.minDelaySec || 0} onChange={handleChange} disabled={simIsRunning || alertConfig?.enableBatchMode} placeholder="Min" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
+                  <input type="number" step="0.0001" name="maxDelaySec" value={alertConfig?.maxDelaySec || 0} onChange={handleChange} disabled={simIsRunning || alertConfig?.enableBatchMode} placeholder="Max" className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-amber-400 font-mono disabled:opacity-50 focus:border-amber-500 focus:outline-none" />
                 </div>
               </div>
             </div>
@@ -1116,10 +1168,18 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
     });
 
     const filteredSwarmAlerts = [];
-    Object.values(swarmGroups).forEach(group => {
-         const newestPing = simIsRunning ? group[group.length - 1] : group[0];
-         if (newestPing) filteredSwarmAlerts.push(newestPing);
-    });
+      Object.values(swarmGroups).forEach(group => {
+           const newestPing = simIsRunning ? group[group.length - 1] : group[0];
+           if (newestPing) {
+               // ADDITIVE UI FIX: Map the historical coordinates and attach them safely to a clone of the ping object
+               const trackHistory = group.map(a => [
+                   a.latitude ?? (a.loc ? a.loc[0] : null),
+                   a.longitude ?? (a.loc ? a.loc[1] : null)
+               ]).filter(coord => coord[0] != null && coord[1] != null);
+
+               filteredSwarmAlerts.push({ ...newestPing, full_track_history: trackHistory });
+           }
+      });
 
     const finalAlerts = [...nonSwarmAlerts, ...filteredSwarmAlerts];
     return showAll ? finalAlerts : finalAlerts.slice(-1500);
@@ -1379,7 +1439,10 @@ export default function App() {
   const [workspaceScenarios, setWorkspaceScenarios] = useState([]);
 
   const [scenario, setScenario] = useState({ id: null, name: 'Operation Alpha', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: 'Default', kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} });
-  const [alertConfig, setAlertConfig] = useState({ minDelaySec: 0.0001, maxDelaySec: 0.0005 });
+  const [alertConfig, setAlertConfig] = useState({ 
+      minDelaySec: 0.0001, maxDelaySec: 0.0005, 
+      enableBatchMode: false, batchSize: 50, batchIntervalSec: 5.0 
+  });
   const [completedRuns, setCompletedRuns] = useState([]);
   const [activeAlerts, setActiveAlerts] = useState([]);
   const [simIsRunning, setSimIsRunning] = useState(false);
