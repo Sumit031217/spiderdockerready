@@ -126,3 +126,6 @@ class SensorEventDB(Base):
     event_id = Column(Integer)
     name = Column(String)
     sensor_type = Column(String)
+
+
+##TESTING IF GIT IS READING THIS FILE

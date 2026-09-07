@@ -612,17 +612,29 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                 })
             else:
                 allocated = 0
+                is_track = device_ground_mode.get(d_obj.id) == "TRACK"
+                
                 if kml_probs:
                     for fname, prob in kml_probs.items():
                         count = int(dev_total * float(prob))
                         if count > 0:
                             clean_target = str(fname).strip().upper()
-                            task_pool.append({"dev": d_obj, "target": clean_target, "remaining": count})
+                            if is_track:
+                                track_pts = generate_bending_track(d_obj, clean_target, device_target_cache, count)
+                                task_pool.append({"dev": d_obj, "target": clean_target, "remaining": count, "is_track": True, "track_points": track_pts, "current_step": 0, "track_id": swarm_track_counter})
+                                swarm_track_counter += 1
+                            else:
+                                task_pool.append({"dev": d_obj, "target": clean_target, "remaining": count, "is_track": False})
                             allocated += count
                             
                 remainder = dev_total - allocated
                 if remainder > 0:
-                    task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": remainder})
+                    if is_track:
+                        track_pts = generate_bending_track(d_obj, "RANDOM", device_target_cache, remainder)
+                        task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": remainder, "is_track": True, "track_points": track_pts, "current_step": 0, "track_id": swarm_track_counter})
+                        swarm_track_counter += 1
+                    else:
+                        task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": remainder, "is_track": False})
 
         with engine_lock:
             engine_state['is_running'] = True
@@ -703,10 +715,15 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                     "speed": locked_speed,
                     "elevation": locked_elevation
                 }
+            elif current_task.get("is_track"):
+                alert_lat, alert_lng, dist, bearing, priority = current_task["track_points"][current_task["current_step"]]
+                track_id = current_task["track_id"]
+                swarm_overrides = {"is_swarm": False, "is_track": True}
+                current_task["current_step"] += 1
             else:
                 alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, target_assignment, device_target_cache)
                 track_id = current_idx + 1
-                swarm_overrides = {"is_swarm": False}
+                swarm_overrides = {"is_swarm": False, "is_track": False}
             
             alert_data = {
                 "run_id": run_id, "sensor_type": d_obj.clean_type, "sensor_name": d_obj.id,
