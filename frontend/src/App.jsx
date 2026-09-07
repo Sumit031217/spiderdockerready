@@ -175,7 +175,10 @@ const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices, scenario }) =
                      radius={5} 
                      pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}
                      eventHandlers={{
-                         mouseover: () => setHoveredTrackId(trackId),
+                         mouseover: (e) => {
+                             e.target.bringToFront();
+                             setHoveredTrackId(trackId);
+                         },
                          mouseout: () => setHoveredTrackId(null)
                      }}
                  >
@@ -930,7 +933,7 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                           )}
 
                           {/* NEW: GROUND MOVEMENT DROPDOWN */}
-                          {(scenario?.deviceDomainMapping?.[dev.id] === 'GROUND' || scenario?.deviceDomainMapping?.[dev.id] === 'BOTH') && (
+                          {(!scenario?.deviceDomainMapping?.[dev.id] || scenario?.deviceDomainMapping?.[dev.id] === 'GROUND' || scenario?.deviceDomainMapping?.[dev.id] === 'BOTH') && (
                               <div className="mt-2 p-2 bg-slate-800/50 rounded border border-slate-700/50 flex flex-col space-y-2">
                                   <div className="flex items-center justify-between">
                                       <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-wider">Ground Movement</span>
@@ -946,6 +949,22 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                                           <option value="TRACK">Continuous Track</option>
                                       </select>
                                   </div>
+                                  
+                                  {/* NEW: MULTI-TRACK / FLEET SIZE OVERLAY */}
+                                  {scenario?.deviceGroundMode?.[dev.id] === 'TRACK' && (
+                                      <div className="flex items-center justify-between border-t border-slate-700/50 pt-2 mt-2">
+                                          <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-wider">Fleet Size (Vehicles)</span>
+                                          <input 
+                                              type="number" min="1" max="200"
+                                              value={scenario?.deviceSwarmSize?.[dev.id] || 1}
+                                              onChange={(e) => setScenario(prev => ({
+                                                  ...prev, 
+                                                  deviceSwarmSize: { ...(prev.deviceSwarmSize || {}), [dev.id]: parseInt(e.target.value, 10) || 1 }
+                                              }))}
+                                              className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[10px] text-white w-[100px] text-right focus:border-emerald-500 focus:outline-none"
+                                          />
+                                      </div>
+                                  )}
                               </div>
                           )}
                       </div>
@@ -1172,8 +1191,9 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
     safeAlerts.forEach(alert => {
         if (!alert) return;
         const sensorId = String(alert.sensor_name || alert.id || '');
-        const isSwarm = scenario?.deviceSwarmMode?.[sensorId] === true || scenario?.deviceSwarmMode?.[sensorId.toUpperCase()] === true;
-        const isTrack = scenario?.deviceGroundMode?.[sensorId] === 'TRACK' || scenario?.deviceGroundMode?.[sensorId.toUpperCase()] === 'TRACK';
+        // THE FIX: Explicitly check the alert payload first to guarantee grouping
+        const isSwarm = alert.is_swarm === true || scenario?.deviceSwarmMode?.[sensorId] === true || scenario?.deviceSwarmMode?.[sensorId.toUpperCase()] === true;
+        const isTrack = alert.is_track === true || scenario?.deviceGroundMode?.[sensorId] === 'TRACK' || scenario?.deviceGroundMode?.[sensorId.toUpperCase()] === 'TRACK';
 
         if (isSwarm || isTrack) {
             let trackId = 'unknown';
@@ -1190,10 +1210,13 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
 
     const filteredSwarmAlerts = [];
       Object.values(swarmGroups).forEach(group => {
-           const newestPing = simIsRunning ? group[group.length - 1] : group[0];
+           // THE FIX: Sort chronologically to guarantee we get the true ending point 
+           // and draw the dotted history line in the correct direction, regardless of DB sorting.
+           const sortedGroup = [...group].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+           const newestPing = sortedGroup[sortedGroup.length - 1];
+           
            if (newestPing) {
-               // ADDITIVE UI FIX: Map the historical coordinates and attach them safely to a clone of the ping object
-               const trackHistory = group.map(a => [
+               const trackHistory = sortedGroup.map(a => [
                    a.latitude ?? (a.loc ? a.loc[0] : null),
                    a.longitude ?? (a.loc ? a.loc[1] : null)
                ]).filter(coord => coord[0] != null && coord[1] != null);
@@ -1611,7 +1634,8 @@ export default function App() {
         deviceDomainMapping: scenario?.deviceDomainMapping || {}, 
         deviceSwarmMode: scenario?.deviceSwarmMode || {}, 
         deviceSwarmSize: scenario?.deviceSwarmSize || {}, 
-        deviceSwarmArc: scenario?.deviceSwarmArc || {}
+        deviceSwarmArc: scenario?.deviceSwarmArc || {},
+        deviceGroundMode: scenario?.deviceGroundMode || {}
     };
     
     try { 

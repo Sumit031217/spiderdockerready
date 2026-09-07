@@ -430,17 +430,110 @@ class OptimizedDevice:
 
 def generate_bending_track(d_obj, target_assignment, device_target_cache, num_points):
     points = []
-    # 1. Start inside a mathematically valid location using your existing strict physics
+    cache = device_target_cache.get(d_obj.id, {})
+    
+    # --- NEW LOGIC: STRICT GEOMETRIC TRACING FOR ROADS/RAILWAYS ---
+    if target_assignment != "RANDOM" and target_assignment in cache.get("lines", {}):
+        valid_lines = cache["lines"][target_assignment]
+        if valid_lines:
+            # 1. Start inside a mathematically valid location using the strict physics engine
+            lat, lng, dist, bearing, priority = sample_spatial_point(d_obj, target_assignment, device_target_cache)
+            points.append((lat, lng, dist, bearing, priority))
+            
+            # 2. Snap that valid starting point perfectly onto the closest 1D mathematical line
+            start_pnt = ShapelyPoint(lng, lat)
+            best_line = valid_lines[0]
+            best_dist = float('inf')
+            
+            for l_dict in valid_lines:
+                dist_to_line = l_dict["geom"].distance(start_pnt)
+                if dist_to_line < best_dist:
+                    best_dist = dist_to_line
+                    best_line = l_dict
+                    
+            current_line = best_line["geom"]
+            line_len = best_line["length"]
+            current_dist = current_line.project(start_pnt)
+            direction = random.choice([1, -1])
+            
+            for _ in range(num_points - 1):
+                step_deg = random.uniform(3.0, 6.0) / 111139.0
+                test_dist = current_dist + (step_deg * direction)
+                
+                # THE FIX: Junction Scanner & Dead-End Handling
+                if test_dist < 0 or test_dist > line_len:
+                    # Grab the exact geographic coordinate of the road's end
+                    end_pt = current_line.interpolate(0 if test_dist < 0 else line_len)
+                    
+                    # Scan for any other roads that connect to this point (within a ~5 meter radius)
+                    possible_turns = []
+                    for l_dict in valid_lines:
+                        if l_dict["geom"] == current_line: continue
+                        if l_dict["geom"].distance(end_pt) < 0.00005: 
+                            possible_turns.append(l_dict)
+                            
+                    if possible_turns:
+                        # JUNCTION FOUND: Take the turn onto the new road
+                        new_line_dict = random.choice(possible_turns)
+                        current_line = new_line_dict["geom"]
+                        line_len = new_line_dict["length"]
+                        current_dist = current_line.project(end_pt)
+                        
+                        # Calculate forward momentum so we drive INTO the new road, not off it
+                        if current_dist <= 0.00001: direction = 1
+                        elif current_dist >= (line_len - 0.00001): direction = -1
+                        else: direction = random.choice([1, -1])
+                        
+                        test_dist = current_dist + (step_deg * direction)
+                    else:
+                        # DEAD END: Perform a U-turn
+                        direction *= -1
+                        test_dist = current_dist + (step_deg * direction)
+                
+                pnt = current_line.interpolate(test_dist)
+                d, b = get_distance_bearing(d_obj.lat, d_obj.lng, pnt.y, pnt.x)
+                
+                # Validate FOV Constraints
+                is_valid = False
+                if d_obj.innerRange <= d <= d_obj.outerRange:
+                    if d_obj.fov >= 360:
+                        is_valid = True
+                    else:
+                        sb = (d_obj.azimuth - (d_obj.fov / 2)) % 360
+                        eb = (d_obj.azimuth + (d_obj.fov / 2)) % 360
+                        if sb <= eb:
+                            if sb <= b <= eb: is_valid = True
+                        else:
+                            if b >= sb or b <= eb: is_valid = True
+                            
+                if is_valid:
+                    current_dist = test_dist
+                    points.append((round(pnt.y, 8), round(pnt.x, 8), round(d, 2), round(b, 2), determine_priority(d)))
+                else:
+                    # If the road exits the sensor FOV, U-turn back into the valid zone
+                    direction *= -1
+                    points.append(points[-1]) 
+                    
+            return points
+
+    # --- ORIGINAL LOGIC: POLYGONS AND RANDOM BENDING WALK ---
     lat, lng, dist, bearing, priority = sample_spatial_point(d_obj, target_assignment, device_target_cache)
     points.append((lat, lng, dist, bearing, priority))
     
     current_lat, current_lng = lat, lng
     current_heading = random.uniform(0, 360)
-    bend_direction = random.choice([15.0, -15.0]) # Direction it curves when it hits a wall
+    
+    # THE FIX: Lock onto the specific polygon to prevent jumping between buildings
+    locked_poly = None
+    if target_assignment != "RANDOM" and target_assignment in cache.get("polygons", {}):
+        start_pt = ShapelyPoint(lng, lat)
+        for poly_dict in cache["polygons"][target_assignment]:
+            if poly_dict["geom"].distance(start_pt) <= 0.00001:
+                locked_poly = poly_dict["geom"]
+                break
     
     def is_point_valid(plat, plng):
         d, b = get_distance_bearing(d_obj.lat, d_obj.lng, plat, plng)
-        # Check FOV
         if not (d_obj.innerRange <= d <= d_obj.outerRange): return False
         if d_obj.fov < 360:
             sb = (d_obj.azimuth - (d_obj.fov / 2)) % 360
@@ -449,31 +542,22 @@ def generate_bending_track(d_obj, target_assignment, device_target_cache, num_po
                 if not (sb <= b <= eb): return False
             else:
                 if not (b >= sb or b <= eb): return False
-        # Check KML
-        if target_assignment != "RANDOM":
-            cache = device_target_cache.get(d_obj.id, {})
+                
+        if target_assignment != "RANDOM" and locked_poly is not None:
             pt = ShapelyPoint(plng, plat)
-            is_valid_kml = False
-            if target_assignment in cache.get("polygons", {}):
-                for cached_poly in cache["polygons"][target_assignment]:
-                    if cached_poly["geom"].contains(pt):
-                        is_valid_kml = True
-                        break
-            if not is_valid_kml and target_assignment in cache.get("lines", {}):
-                for cached_line in cache["lines"][target_assignment]:
-                    if cached_line["geom"].distance(pt) < 0.00015: # ~15m buffer for roads
-                        is_valid_kml = True
-                        break
-            if not is_valid_kml: return False
+            # STRICT CONTAINMENT: Must be completely inside the walls, no 15m slack
+            if not locked_poly.contains(pt):
+                return False
         return True
 
     for _ in range(num_points - 1):
         valid_next = False
         attempts = 0
         test_heading = current_heading
-        step_size_m = random.uniform(3.0, 6.0) # Moves 3-6 meters per alert
+        # THE FIX: Shorter steps for humans/animals (1-3m) to prevent leaping through thin walls
+        step_size_m = random.uniform(1.0, 3.0)
         
-        while not valid_next and attempts < 24: # Bends up to 360 degrees
+        while not valid_next and attempts < 24:
             n_lat, n_lng = fast_destination(current_lat, current_lng, step_size_m, test_heading)
             if is_point_valid(n_lat, n_lng):
                 valid_next = True
@@ -482,20 +566,27 @@ def generate_bending_track(d_obj, target_assignment, device_target_cache, num_po
                 s_dist, s_brng = get_distance_bearing(d_obj.lat, d_obj.lng, current_lat, current_lng)
                 points.append((current_lat, current_lng, s_dist, s_brng, determine_priority(s_dist)))
             else:
-                test_heading = (test_heading + bend_direction) % 360
+                # THE FIX: Roomba bounce. Sharp 45 to 135 degree turns when hitting an interior wall
+                test_heading = (test_heading + random.choice([45.0, -45.0, 90.0, -90.0, 135.0, -135.0])) % 360
                 attempts += 1
                 
         if not valid_next:
-            # If completely cornered by geometry, teleport to a new valid spot to resume tracking
             lat, lng, dist, bearing, priority = sample_spatial_point(d_obj, target_assignment, device_target_cache)
             current_lat, current_lng = lat, lng
             points.append((lat, lng, dist, bearing, priority))
             current_heading = random.uniform(0, 360)
-            bend_direction = random.choice([15.0, -15.0])
+            
+            # Re-lock polygon if teleported
+            if target_assignment != "RANDOM" and target_assignment in cache.get("polygons", {}):
+                start_pt = ShapelyPoint(lng, lat)
+                for poly_dict in cache["polygons"][target_assignment]:
+                    if poly_dict["geom"].distance(start_pt) <= 0.00001:
+                        locked_poly = poly_dict["geom"]
+                        break
             
     return points
 
-def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping, device_swarm_mode, device_swarm_size, device_swarm_arc, batch_mode=False, batch_size=50, batch_interval=5.0):
+def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping, device_swarm_mode, device_swarm_size, device_swarm_arc, device_ground_mode, batch_mode=False, batch_size=50, batch_interval=5.0, ):
     global engine_state
     
     try:
@@ -613,6 +704,8 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
             else:
                 allocated = 0
                 is_track = device_ground_mode.get(d_obj.id) == "TRACK"
+                # Safely fetch the requested ground fleet size (defaulting to 1 if untouched)
+                fleet_size = max(1, int(device_swarm_size.get(d_obj.id, 1))) if is_track else 1
                 
                 if kml_probs:
                     for fname, prob in kml_probs.items():
@@ -620,9 +713,15 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                         if count > 0:
                             clean_target = str(fname).strip().upper()
                             if is_track:
-                                track_pts = generate_bending_track(d_obj, clean_target, device_target_cache, count)
-                                task_pool.append({"dev": d_obj, "target": clean_target, "remaining": count, "is_track": True, "track_points": track_pts, "current_step": 0, "track_id": swarm_track_counter})
-                                swarm_track_counter += 1
+                                # THE FIX: Removed max(1, ...) to prevent generating phantom tasks
+                                pts_per_v = count // fleet_size
+                                remainder_pts = count % fleet_size
+                                for v in range(fleet_size):
+                                    v_count = pts_per_v + (1 if v < remainder_pts else 0)
+                                    if v_count > 0:
+                                        track_pts = generate_bending_track(d_obj, clean_target, device_target_cache, v_count)
+                                        task_pool.append({"dev": d_obj, "target": clean_target, "remaining": v_count, "is_track": True, "track_points": track_pts, "current_step": 0, "track_id": swarm_track_counter})
+                                        swarm_track_counter += 1
                             else:
                                 task_pool.append({"dev": d_obj, "target": clean_target, "remaining": count, "is_track": False})
                             allocated += count
@@ -630,9 +729,15 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                 remainder = dev_total - allocated
                 if remainder > 0:
                     if is_track:
-                        track_pts = generate_bending_track(d_obj, "RANDOM", device_target_cache, remainder)
-                        task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": remainder, "is_track": True, "track_points": track_pts, "current_step": 0, "track_id": swarm_track_counter})
-                        swarm_track_counter += 1
+                        # THE FIX: Removed max(1, ...) here as well
+                        pts_per_v = remainder // fleet_size
+                        remainder_pts = remainder % fleet_size
+                        for v in range(fleet_size):
+                            v_count = pts_per_v + (1 if v < remainder_pts else 0)
+                            if v_count > 0:
+                                track_pts = generate_bending_track(d_obj, "RANDOM", device_target_cache, v_count)
+                                task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": v_count, "is_track": True, "track_points": track_pts, "current_step": 0, "track_id": swarm_track_counter})
+                                swarm_track_counter += 1
                     else:
                         task_pool.append({"dev": d_obj, "target": "RANDOM", "remaining": remainder, "is_track": False})
 
@@ -711,15 +816,11 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                 
                 swarm_overrides = {
                     "is_swarm": True,
+                    "is_track": False,
                     "height": locked_height,
                     "speed": locked_speed,
                     "elevation": locked_elevation
                 }
-            elif current_task.get("is_track"):
-                alert_lat, alert_lng, dist, bearing, priority = current_task["track_points"][current_task["current_step"]]
-                track_id = current_task["track_id"]
-                swarm_overrides = {"is_swarm": False, "is_track": True}
-                current_task["current_step"] += 1
             elif current_task.get("is_track"):
                 alert_lat, alert_lng, dist, bearing, priority = current_task["track_points"][current_task["current_step"]]
                 track_id = current_task["track_id"]
@@ -857,6 +958,7 @@ def api_engine_start(payload: dict):
             payload.get("deviceSwarmMode", {}), 
             payload.get("deviceSwarmSize", {}),
             payload.get("deviceSwarmArc", {}),
+            payload.get("deviceGroundMode", {}), # <-- THE MISSING ARGUMENT
             # --- ADDITIVE BATCH ARGUMENTS ---
             payload["alertConfig"].get("enableBatchMode", False),
             payload["alertConfig"].get("batchSize", 50),
@@ -1141,7 +1243,7 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
         deviceDomainMapping=domain_str,
         deviceSwarmMode=swarm_mode_str,
         deviceSwarmSize=swarm_size_str,
-        deviceSwarmArc=swarm_arc_str
+        deviceSwarmArc=swarm_arc_str,   
         deviceGroundMode=ground_mode_str
     )
     db.add(new_s)
