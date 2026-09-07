@@ -554,9 +554,13 @@ def generate_bending_track(d_obj, target_assignment, device_target_cache, num_po
         valid_next = False
         attempts = 0
         test_heading = current_heading
-        # THE FIX: Shorter steps for humans/animals (1-3m) to prevent leaping through thin walls
-        step_size_m = random.uniform(1.0, 3.0)
         
+        # DYNAMIC KINEMATICS: Humans in buildings walk 1-3m. Off-road fleets drive 8-18m.
+        if target_assignment != "RANDOM" and locked_poly is not None:
+            step_size_m = random.uniform(1.0, 3.0)
+        else:
+            step_size_m = random.uniform(8.0, 18.0)
+            
         while not valid_next and attempts < 24:
             n_lat, n_lng = fast_destination(current_lat, current_lng, step_size_m, test_heading)
             if is_point_valid(n_lat, n_lng):
@@ -776,7 +780,7 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                 engine_state['logs'].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "msg": f"DB START ERROR: {str(e)}", "type": "error"})
 
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        ui_alerts = deque(maxlen=1000)
+        ui_alerts = deque(maxlen=10000)
         db_chunk = []
         last_ui_update_time = 0
 
@@ -986,7 +990,7 @@ def api_engine_stop():
 def get_active_alerts(db: Session = Depends(get_db)):
     last_run = db.query(SimulationRun).order_by(SimulationRun.id.desc()).first()
     if last_run:
-        alerts_query = db.query(AlertLog).filter(AlertLog.run_id == last_run.id).order_by(AlertLog.id.desc()).limit(1000).all()
+        alerts_query = db.query(AlertLog).filter(AlertLog.run_id == last_run.id).order_by(AlertLog.id.desc()).limit(15000).all()
         return [{
             "sensor_type": a.sensor_type, "sensor_name": a.sensor_name, "alert_id": a.alert_id,
             "priority": a.priority, "latitude": a.latitude, "longitude": a.longitude,

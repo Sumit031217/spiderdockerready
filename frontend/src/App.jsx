@@ -1137,7 +1137,6 @@ const AlertGeneratorView = ({
 const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAlertsGenerated, activeWorkspace, clearAlerts, scenario }) => {
   const mapContainerRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [showAll, setShowAll] = useState(false);
   const [hiddenLayers, setHiddenLayers] = useState({});
   const [isLayerPanelOpen, setIsLayerPanelOpen] = useState(false);
 
@@ -1160,10 +1159,6 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
       document.exitFullscreen();
     }
   };
-
-  useEffect(() => {
-    if (simIsRunning) setShowAll(false);
-  }, [simIsRunning]);
 
   const toggleLayer = (layerKey) => {
     setHiddenLayers(prev => ({ ...prev, [layerKey]: !prev[layerKey] }));
@@ -1225,9 +1220,11 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
            }
       });
 
-    const finalAlerts = [...nonSwarmAlerts, ...filteredSwarmAlerts];
-    return showAll ? finalAlerts : finalAlerts.slice(-1500);
-  }, [safeAlerts, showAll, hiddenLayers, simIsRunning, scenario]);
+    // DOM PROTECTION: Cap individual scattered dots at 1500 to save RAM, 
+    // but pass 100% of the Swarm/Track arrays through since they render as a single lightweight SVG Polyline.
+    const finalAlerts = [...nonSwarmAlerts.slice(-1500), ...filteredSwarmAlerts];
+    return finalAlerts;
+  }, [safeAlerts, hiddenLayers, simIsRunning, scenario]);
 
   return (
     <div className="p-6 space-y-4 max-w-[1600px] mx-auto h-[calc(100vh-4rem)] flex flex-col font-sans relative">
@@ -1306,11 +1303,6 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
           <button onClick={toggleFullscreen} className="bg-slate-900/90 backdrop-blur border border-slate-700 p-2.5 rounded-lg shadow-2xl hover:bg-slate-800 transition-colors text-white group cursor-pointer" title="Toggle Fullscreen">
             {isFullscreen ? <Minimize className="w-5 h-5 text-cyan-400 group-hover:scale-110 transition-transform" /> : <Maximize className="w-5 h-5 text-cyan-400 group-hover:scale-110 transition-transform" />}
           </button>
-          {safeAlerts.length > 1000 && !simIsRunning && (
-              <button onClick={() => setShowAll(!showAll)} className={`font-bold py-2 px-4 rounded shadow-lg text-xs flex items-center transition-colors cursor-pointer ${showAll ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-rose-600 hover:bg-rose-500 text-white'}`}>
-                  {showAll ? 'SHOW LATEST 1000 ONLY' : `LOAD ALL ${safeAlerts.length} ALERTS (MAY LAG)`}
-              </button>
-          )}
         </div>
 
         {isFullscreen && (
