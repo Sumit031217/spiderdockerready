@@ -720,11 +720,15 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                 track_id = current_task["track_id"]
                 swarm_overrides = {"is_swarm": False, "is_track": True}
                 current_task["current_step"] += 1
+            elif current_task.get("is_track"):
+                alert_lat, alert_lng, dist, bearing, priority = current_task["track_points"][current_task["current_step"]]
+                track_id = current_task["track_id"]
+                swarm_overrides = {"is_swarm": False, "is_track": True}
+                current_task["current_step"] += 1
             else:
                 alert_lat, alert_lng, dist, bearing, priority = sample_spatial_point(d_obj, target_assignment, device_target_cache)
                 track_id = current_idx + 1
                 swarm_overrides = {"is_swarm": False, "is_track": False}
-            
             alert_data = {
                 "run_id": run_id, "sensor_type": d_obj.clean_type, "sensor_name": d_obj.id,
                 "alert_id": track_id, "priority": priority, "latitude": alert_lat, "longitude": alert_lng,

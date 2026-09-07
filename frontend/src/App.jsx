@@ -641,7 +641,7 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
               id: null, name: newScenarioName.trim(), activeDevices: [], 
               udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, 
               kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, 
-              deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} 
+              deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {}, deviceGroundMode: {} 
           });
           setNewScenarioName('');
           setStatus('Draft Created. Configure & Save to DB.');
@@ -753,7 +753,7 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                       onChange={(e) => {
                           const val = e.target.value;
                           if (val === '') {
-                              setScenario({ id: null, name: 'New Operation', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} });
+                              setScenario({ id: null, name: 'New Operation', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {}, deviceGroundMode: {}  });
                           } else {
                               const selected = safeWorkspaceScenarios.find(s => s.id === val);
                               if (selected) setScenario(selected);
@@ -926,6 +926,26 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                                           </div>
                                       </>
                                   )}
+                              </div>
+                          )}
+
+                          {/* NEW: GROUND MOVEMENT DROPDOWN */}
+                          {(scenario?.deviceDomainMapping?.[dev.id] === 'GROUND' || scenario?.deviceDomainMapping?.[dev.id] === 'BOTH') && (
+                              <div className="mt-2 p-2 bg-slate-800/50 rounded border border-slate-700/50 flex flex-col space-y-2">
+                                  <div className="flex items-center justify-between">
+                                      <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-wider">Ground Movement</span>
+                                      <select
+                                          value={scenario?.deviceGroundMode?.[dev.id] || 'RANDOM'}
+                                          onChange={(e) => setScenario(prev => ({
+                                              ...prev, 
+                                              deviceGroundMode: { ...(prev.deviceGroundMode || {}), [dev.id]: e.target.value }
+                                          }))}
+                                          className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[10px] text-white focus:outline-none cursor-pointer w-[100px]"
+                                      >
+                                          <option value="RANDOM">Scattered Random</option>
+                                          <option value="TRACK">Continuous Track</option>
+                                      </select>
+                                  </div>
                               </div>
                           )}
                       </div>
@@ -1153,8 +1173,9 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
         if (!alert) return;
         const sensorId = String(alert.sensor_name || alert.id || '');
         const isSwarm = scenario?.deviceSwarmMode?.[sensorId] === true || scenario?.deviceSwarmMode?.[sensorId.toUpperCase()] === true;
+        const isTrack = scenario?.deviceGroundMode?.[sensorId] === 'TRACK' || scenario?.deviceGroundMode?.[sensorId.toUpperCase()] === 'TRACK';
 
-        if (isSwarm) {
+        if (isSwarm || isTrack) {
             let trackId = 'unknown';
             if (alert.alert_id !== undefined && alert.alert_id !== null) trackId = String(alert.alert_id);
             else if (alert.track_id !== undefined && alert.track_id !== null) trackId = String(alert.track_id);
@@ -1438,7 +1459,7 @@ export default function App() {
   const [activeWorkspace, setActiveWorkspace] = useState(() => localStorage.getItem('simcore_workspace') || 'Default');
   const [workspaceScenarios, setWorkspaceScenarios] = useState([]);
 
-  const [scenario, setScenario] = useState({ id: null, name: 'Operation Alpha', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: 'Default', kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} });
+  const [scenario, setScenario] = useState({ id: null, name: 'Operation Alpha', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: 'Default', kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {}, deviceGroundMode: {}  });
   const [alertConfig, setAlertConfig] = useState({ 
       minDelaySec: 0.0001, maxDelaySec: 0.0005, 
       enableBatchMode: false, batchSize: 50, batchIntervalSec: 5.0 
@@ -1497,7 +1518,7 @@ export default function App() {
                   return scenarios[0];
               });
           } else {
-              setScenario({ id: null, name: 'New Operation', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} });
+              setScenario({ id: null, name: 'New Operation', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {}, deviceGroundMode: {} });
           }
       }).catch(e => console.error(e));
   };
