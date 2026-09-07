@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
@@ -89,12 +89,13 @@ class ScenarioStateDB(Base):
     # Kept explicit lowercase mapping ONLY for the newly injected columns
     kmlProbabilities = Column("kmlprobabilities", Text, default="{}") 
     deviceAlertMapping = Column("devicealertmapping", Text, default="{}") 
-    
+    deviceDomainMapping = Column(JSON, default={})
     # --- NEW: REGISTERED SWARM & KINEMATIC COLUMNS ---
     deviceDomainMapping = Column("devicedomainmapping", Text, default="{}")
     deviceSwarmMode = Column("deviceswarmmode", Text, default="{}")
     deviceSwarmSize = Column("deviceswarmsize", Text, default="{}")
     deviceSwarmArc = Column("deviceswarmarc", Text, default="{}")
+    deviceGroundMode = Column("devicegroundmode", Text, default="{}")
 
 class ActiveAlertDB(Base):
     __tablename__ = "active_alerts"

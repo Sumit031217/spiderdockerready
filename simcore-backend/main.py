@@ -52,6 +52,8 @@ try:
         except: pass
         try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN deviceswarmarc TEXT DEFAULT '{}';"))
         except: pass
+        try: conn.execute(text("ALTER TABLE scenario_state ADD COLUMN devicegroundmode TEXT DEFAULT '{}';"))
+        except: pass
 except Exception as e:
     print("\nWARNING: Could not connect to PostgreSQL Database:", e)
 
@@ -424,7 +426,7 @@ class OptimizedDevice:
         self.polygon = d.get('polygon', [])
         self.packetChoice = d.get('packetChoice', '')
 
-def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping, device_swarm_mode, device_swarm_size, device_swarm_arc):
+def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping, device_swarm_mode, device_swarm_size, device_swarm_arc, batch_mode=False, batch_size=50, batch_interval=5.0):
     global engine_state
     
     try:
@@ -513,7 +515,15 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                     
                     # Engulfs the perimeter dynamically (between 50% and 120% of the building's measured size)
                     end_spread = random.uniform(target_radius_m * 0.5, target_radius_m * 1.2)
-                    end_angle = random.uniform(0, 360)
+                    
+                    # THE FIX: Preserve 360 logic for omni sensors, bound the angle strictly for directional sensors
+                    if d_obj.fov >= 360:
+                        end_angle = random.uniform(0, 360)
+                    else:
+                        fov_start = d_obj.azimuth - (d_obj.fov / 2)
+                        fov_end = d_obj.azimuth + (d_obj.fov / 2)
+                        end_angle = random.uniform(fov_start, fov_end) % 360
+                        
                     end_lat, end_lng = fast_destination(target_lat, target_lng, end_spread, end_angle)
                     
                     drones.append({
@@ -668,8 +678,17 @@ def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices,
                 task_pool[task_idx] = task_pool[-1]
                 task_pool.pop()
 
-            delay = random.uniform(float(minDelay), float(maxDelay))
-            if delay > 0: time.sleep(delay)
+            # THE FIX: Additive Batch Mode Logic (Protects original logic)
+            if batch_mode:
+                safe_batch_size = max(1, int(batch_size))
+                # Trigger sleep ONLY if we hit the heap limit, or if it's the final packet of the mission
+                if (current_idx + 1) % safe_batch_size == 0 or current_idx == total_alerts_requested - 1:
+                    if float(batch_interval) > 0:
+                        time.sleep(float(batch_interval))
+            else:
+                # ORIGINAL LOGIC: Sequential random physics
+                delay = random.uniform(float(minDelay), float(maxDelay))
+                if delay > 0: time.sleep(delay)
 
         udp_socket.close()
         if db_chunk:
@@ -742,12 +761,16 @@ def api_engine_start(payload: dict):
         args=(
             payload["scenarioName"], payload["udpIp"], payload["udpPort"],
             payload["activeDevices"], payload["environmentDevices"], payload["sensorSchemas"],
-            payload["alertConfig"]["minDelaySec"], payload["alertConfig"]["maxDelaySec"],
+            payload["alertConfig"].get("minDelaySec", 0), payload["alertConfig"].get("maxDelaySec", 0),
             payload.get("kmlProbabilities", {}), payload.get("deviceAlertMapping", {}),
             payload.get("deviceDomainMapping", {}),
-            payload.get("deviceSwarmMode", {}),  # <-- ADD THIS
+            payload.get("deviceSwarmMode", {}), 
             payload.get("deviceSwarmSize", {}),
-            payload.get("deviceSwarmArc", {})
+            payload.get("deviceSwarmArc", {}),
+            # --- ADDITIVE BATCH ARGUMENTS ---
+            payload["alertConfig"].get("enableBatchMode", False),
+            payload["alertConfig"].get("batchSize", 50),
+            payload["alertConfig"].get("batchIntervalSec", 5.0)
         ),
         daemon=True
     )
@@ -1030,7 +1053,19 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
     db.commit()
     
     return {"status": "success", "id": new_id}
-
+@app.get("/api/workspaces")
+def get_all_workspaces(db: Session = Depends(get_db)):
+    try:
+        # Ask PostgreSQL for all unique workspace names currently saved in scenarios
+        scenario_ws = [row[0] for row in db.query(ScenarioStateDB.workspace).distinct().all() if row[0]]
+        
+        # Deduplicate and ensure 'Default' is always in the list
+        unique_workspaces = list(set(["Default"] + scenario_ws))
+        
+        return {"status": "success", "workspaces": unique_workspaces}
+    except Exception as e:
+        print(f"Error fetching workspaces: {e}")
+        return {"status": "error", "workspaces": ["Default"]}
 @app.get("/api/state/scenarios/{workspace}")
 def get_workspace_scenarios(workspace: str, db: Session = Depends(get_db)):
     scenarios = db.query(ScenarioStateDB).filter(ScenarioStateDB.workspace == workspace).all()
