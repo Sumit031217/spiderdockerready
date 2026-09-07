@@ -122,6 +122,7 @@ class ScenarioModel(BaseModel):
     deviceSwarmMode: Optional[dict] = {}
     deviceSwarmSize: Optional[dict] = {}
     deviceSwarmArc: Optional[dict] = {}
+    deviceGroundMode: Optional[dict] = {}
 
 class RangeExportRequest(BaseModel):
     startTime: str
@@ -425,6 +426,74 @@ class OptimizedDevice:
         self.isPolygon = bool(d.get('isPolygon', False))
         self.polygon = d.get('polygon', [])
         self.packetChoice = d.get('packetChoice', '')
+
+
+def generate_bending_track(d_obj, target_assignment, device_target_cache, num_points):
+    points = []
+    # 1. Start inside a mathematically valid location using your existing strict physics
+    lat, lng, dist, bearing, priority = sample_spatial_point(d_obj, target_assignment, device_target_cache)
+    points.append((lat, lng, dist, bearing, priority))
+    
+    current_lat, current_lng = lat, lng
+    current_heading = random.uniform(0, 360)
+    bend_direction = random.choice([15.0, -15.0]) # Direction it curves when it hits a wall
+    
+    def is_point_valid(plat, plng):
+        d, b = get_distance_bearing(d_obj.lat, d_obj.lng, plat, plng)
+        # Check FOV
+        if not (d_obj.innerRange <= d <= d_obj.outerRange): return False
+        if d_obj.fov < 360:
+            sb = (d_obj.azimuth - (d_obj.fov / 2)) % 360
+            eb = (d_obj.azimuth + (d_obj.fov / 2)) % 360
+            if sb <= eb:
+                if not (sb <= b <= eb): return False
+            else:
+                if not (b >= sb or b <= eb): return False
+        # Check KML
+        if target_assignment != "RANDOM":
+            cache = device_target_cache.get(d_obj.id, {})
+            pt = ShapelyPoint(plng, plat)
+            is_valid_kml = False
+            if target_assignment in cache.get("polygons", {}):
+                for cached_poly in cache["polygons"][target_assignment]:
+                    if cached_poly["geom"].contains(pt):
+                        is_valid_kml = True
+                        break
+            if not is_valid_kml and target_assignment in cache.get("lines", {}):
+                for cached_line in cache["lines"][target_assignment]:
+                    if cached_line["geom"].distance(pt) < 0.00015: # ~15m buffer for roads
+                        is_valid_kml = True
+                        break
+            if not is_valid_kml: return False
+        return True
+
+    for _ in range(num_points - 1):
+        valid_next = False
+        attempts = 0
+        test_heading = current_heading
+        step_size_m = random.uniform(3.0, 6.0) # Moves 3-6 meters per alert
+        
+        while not valid_next and attempts < 24: # Bends up to 360 degrees
+            n_lat, n_lng = fast_destination(current_lat, current_lng, step_size_m, test_heading)
+            if is_point_valid(n_lat, n_lng):
+                valid_next = True
+                current_lat, current_lng = n_lat, n_lng
+                current_heading = test_heading
+                s_dist, s_brng = get_distance_bearing(d_obj.lat, d_obj.lng, current_lat, current_lng)
+                points.append((current_lat, current_lng, s_dist, s_brng, determine_priority(s_dist)))
+            else:
+                test_heading = (test_heading + bend_direction) % 360
+                attempts += 1
+                
+        if not valid_next:
+            # If completely cornered by geometry, teleport to a new valid spot to resume tracking
+            lat, lng, dist, bearing, priority = sample_spatial_point(d_obj, target_assignment, device_target_cache)
+            current_lat, current_lng = lat, lng
+            points.append((lat, lng, dist, bearing, priority))
+            current_heading = random.uniform(0, 360)
+            bend_direction = random.choice([15.0, -15.0])
+            
+    return points
 
 def simulation_worker(scenarioName, udpIp, udpPort, active_devices, env_devices, schemas, minDelay, maxDelay, kml_probs, device_alert_mapping, device_domain_mapping, device_swarm_mode, device_swarm_size, device_swarm_arc, batch_mode=False, batch_size=50, batch_interval=5.0):
     global engine_state
@@ -984,7 +1053,8 @@ def get_scenario_state(workspace_name: str, db: Session = Depends(get_db)):
             # --- NEW SWARM CONTROLS ---
             "deviceSwarmMode": json.loads(getattr(s, 'deviceswarmmode', '{}')) if getattr(s, 'deviceswarmmode', None) else {},
             "deviceSwarmSize": json.loads(getattr(s, 'deviceswarmsize', '{}')) if getattr(s, 'deviceswarmsize', None) else {},
-            "deviceSwarmArc": json.loads(getattr(s, 'deviceswarmarc', '{}')) if getattr(s, 'deviceswarmarc', None) else {}
+            "deviceSwarmArc": json.loads(getattr(s, 'deviceswarmarc', '{}')) if getattr(s, 'deviceswarmarc', None) else {},
+            "deviceGroundMode": json.loads(getattr(s, 'devicegroundmode', '{}')) if getattr(s, 'devicegroundmode', None) else {}
         }
     
     # Fallback if no scenario exists for this workspace yet
@@ -999,7 +1069,8 @@ def get_scenario_state(workspace_name: str, db: Session = Depends(get_db)):
         "deviceDomainMapping": {},
         "deviceSwarmMode": {},
         "deviceSwarmSize": {},
-        "deviceSwarmArc": {}
+        "deviceSwarmArc": {},
+        "deviceGroundMode": {}
     }
 
 @app.post("/api/state/scenario")
@@ -1014,6 +1085,7 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
     swarm_mode_str = json.dumps(getattr(payload, 'deviceSwarmMode', {}) or {})
     swarm_size_str = json.dumps(getattr(payload, 'deviceSwarmSize', {}) or {})
     swarm_arc_str = json.dumps(getattr(payload, 'deviceSwarmArc', {}) or {})
+    ground_mode_str = json.dumps(getattr(payload, 'deviceGroundMode', {}) or {})
 
     # OPTIMIZATION: Only query the DB if we already have an ID (Updating)
     if payload.id:
@@ -1030,6 +1102,7 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
             existing.deviceSwarmMode = swarm_mode_str
             existing.deviceSwarmSize = swarm_size_str
             existing.deviceSwarmArc = swarm_arc_str
+            existing.deviceGroundMode = ground_mode_str
             db.commit()
             return {"status": "success", "id": payload.id}
     
@@ -1048,6 +1121,7 @@ def save_scenario_state(payload: ScenarioModel, db: Session = Depends(get_db)):
         deviceSwarmMode=swarm_mode_str,
         deviceSwarmSize=swarm_size_str,
         deviceSwarmArc=swarm_arc_str
+        deviceGroundMode=ground_mode_str
     )
     db.add(new_s)
     db.commit()
@@ -1085,6 +1159,7 @@ def get_workspace_scenarios(workspace: str, db: Session = Depends(get_db)):
             "deviceDomainMapping": json.loads(s.deviceDomainMapping) if s.deviceDomainMapping else {},
             "deviceSwarmMode": json.loads(s.deviceSwarmMode) if s.deviceSwarmMode else {},
             "deviceSwarmSize": json.loads(s.deviceSwarmSize) if s.deviceSwarmSize else {},
-            "deviceSwarmArc": json.loads(s.deviceSwarmArc) if s.deviceSwarmArc else {}
+            "deviceSwarmArc": json.loads(s.deviceSwarmArc) if s.deviceSwarmArc else {},
+            "deviceGroundMode": json.loads(s.deviceGroundMode) if hasattr(s, 'deviceGroundMode') and s.deviceGroundMode else {}
         })
     return res
