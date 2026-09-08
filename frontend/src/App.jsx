@@ -175,7 +175,10 @@ const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices, scenario }) =
                      radius={5} 
                      pathOptions={{ color: '#ffffff', fillColor: pinColor, fillOpacity: 1, weight: 1 }}
                      eventHandlers={{
-                         mouseover: () => setHoveredTrackId(trackId),
+                         mouseover: (e) => {
+                             e.target.bringToFront();
+                             setHoveredTrackId(trackId);
+                         },
                          mouseout: () => setHoveredTrackId(null)
                      }}
                  >
@@ -641,7 +644,7 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
               id: null, name: newScenarioName.trim(), activeDevices: [], 
               udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, 
               kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, 
-              deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} 
+              deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {}, deviceGroundMode: {} 
           });
           setNewScenarioName('');
           setStatus('Draft Created. Configure & Save to DB.');
@@ -753,7 +756,7 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                       onChange={(e) => {
                           const val = e.target.value;
                           if (val === '') {
-                              setScenario({ id: null, name: 'New Operation', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} });
+                              setScenario({ id: null, name: 'New Operation', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {}, deviceGroundMode: {}  });
                           } else {
                               const selected = safeWorkspaceScenarios.find(s => s.id === val);
                               if (selected) setScenario(selected);
@@ -928,6 +931,42 @@ const ScenarioBuilderView = ({ scenario, setScenario, devices, sensorSchemas, ac
                                   )}
                               </div>
                           )}
+
+                          {/* NEW: GROUND MOVEMENT DROPDOWN */}
+                          {(!scenario?.deviceDomainMapping?.[dev.id] || scenario?.deviceDomainMapping?.[dev.id] === 'GROUND' || scenario?.deviceDomainMapping?.[dev.id] === 'BOTH') && (
+                              <div className="mt-2 p-2 bg-slate-800/50 rounded border border-slate-700/50 flex flex-col space-y-2">
+                                  <div className="flex items-center justify-between">
+                                      <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-wider">Ground Movement</span>
+                                      <select
+                                          value={scenario?.deviceGroundMode?.[dev.id] || 'RANDOM'}
+                                          onChange={(e) => setScenario(prev => ({
+                                              ...prev, 
+                                              deviceGroundMode: { ...(prev.deviceGroundMode || {}), [dev.id]: e.target.value }
+                                          }))}
+                                          className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[10px] text-white focus:outline-none cursor-pointer w-[100px]"
+                                      >
+                                          <option value="RANDOM">Scattered Random</option>
+                                          <option value="TRACK">Continuous Track</option>
+                                      </select>
+                                  </div>
+                                  
+                                  {/* NEW: MULTI-TRACK / FLEET SIZE OVERLAY */}
+                                  {scenario?.deviceGroundMode?.[dev.id] === 'TRACK' && (
+                                      <div className="flex items-center justify-between border-t border-slate-700/50 pt-2 mt-2">
+                                          <span className="text-[10px] font-mono text-emerald-300 uppercase tracking-wider">Fleet Size (Vehicles)</span>
+                                          <input 
+                                              type="number" min="1" max="200"
+                                              value={scenario?.deviceSwarmSize?.[dev.id] || 1}
+                                              onChange={(e) => setScenario(prev => ({
+                                                  ...prev, 
+                                                  deviceSwarmSize: { ...(prev.deviceSwarmSize || {}), [dev.id]: parseInt(e.target.value, 10) || 1 }
+                                              }))}
+                                              className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[10px] text-white w-[100px] text-right focus:border-emerald-500 focus:outline-none"
+                                          />
+                                      </div>
+                                  )}
+                              </div>
+                          )}
                       </div>
                   )}
                 </div>
@@ -1098,7 +1137,6 @@ const AlertGeneratorView = ({
 const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAlertsGenerated, activeWorkspace, clearAlerts, scenario }) => {
   const mapContainerRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [showAll, setShowAll] = useState(false);
   const [hiddenLayers, setHiddenLayers] = useState({});
   const [isLayerPanelOpen, setIsLayerPanelOpen] = useState(false);
 
@@ -1121,10 +1159,6 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
       document.exitFullscreen();
     }
   };
-
-  useEffect(() => {
-    if (simIsRunning) setShowAll(false);
-  }, [simIsRunning]);
 
   const toggleLayer = (layerKey) => {
     setHiddenLayers(prev => ({ ...prev, [layerKey]: !prev[layerKey] }));
@@ -1152,9 +1186,11 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
     safeAlerts.forEach(alert => {
         if (!alert) return;
         const sensorId = String(alert.sensor_name || alert.id || '');
-        const isSwarm = scenario?.deviceSwarmMode?.[sensorId] === true || scenario?.deviceSwarmMode?.[sensorId.toUpperCase()] === true;
+        // THE FIX: Explicitly check the alert payload first to guarantee grouping
+        const isSwarm = alert.is_swarm === true || scenario?.deviceSwarmMode?.[sensorId] === true || scenario?.deviceSwarmMode?.[sensorId.toUpperCase()] === true;
+        const isTrack = alert.is_track === true || scenario?.deviceGroundMode?.[sensorId] === 'TRACK' || scenario?.deviceGroundMode?.[sensorId.toUpperCase()] === 'TRACK';
 
-        if (isSwarm) {
+        if (isSwarm || isTrack) {
             let trackId = 'unknown';
             if (alert.alert_id !== undefined && alert.alert_id !== null) trackId = String(alert.alert_id);
             else if (alert.track_id !== undefined && alert.track_id !== null) trackId = String(alert.track_id);
@@ -1169,10 +1205,13 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
 
     const filteredSwarmAlerts = [];
       Object.values(swarmGroups).forEach(group => {
-           const newestPing = simIsRunning ? group[group.length - 1] : group[0];
+           // THE FIX: Sort chronologically to guarantee we get the true ending point 
+           // and draw the dotted history line in the correct direction, regardless of DB sorting.
+           const sortedGroup = [...group].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+           const newestPing = sortedGroup[sortedGroup.length - 1];
+           
            if (newestPing) {
-               // ADDITIVE UI FIX: Map the historical coordinates and attach them safely to a clone of the ping object
-               const trackHistory = group.map(a => [
+               const trackHistory = sortedGroup.map(a => [
                    a.latitude ?? (a.loc ? a.loc[0] : null),
                    a.longitude ?? (a.loc ? a.loc[1] : null)
                ]).filter(coord => coord[0] != null && coord[1] != null);
@@ -1181,9 +1220,11 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
            }
       });
 
-    const finalAlerts = [...nonSwarmAlerts, ...filteredSwarmAlerts];
-    return showAll ? finalAlerts : finalAlerts.slice(-1500);
-  }, [safeAlerts, showAll, hiddenLayers, simIsRunning, scenario]);
+    // DOM PROTECTION: Cap individual scattered dots at 1500 to save RAM, 
+    // but pass 100% of the Swarm/Track arrays through since they render as a single lightweight SVG Polyline.
+    const finalAlerts = [...nonSwarmAlerts.slice(-1500), ...filteredSwarmAlerts];
+    return finalAlerts;
+  }, [safeAlerts, hiddenLayers, simIsRunning, scenario]);
 
   return (
     <div className="p-6 space-y-4 max-w-[1600px] mx-auto h-[calc(100vh-4rem)] flex flex-col font-sans relative">
@@ -1262,11 +1303,6 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
           <button onClick={toggleFullscreen} className="bg-slate-900/90 backdrop-blur border border-slate-700 p-2.5 rounded-lg shadow-2xl hover:bg-slate-800 transition-colors text-white group cursor-pointer" title="Toggle Fullscreen">
             {isFullscreen ? <Minimize className="w-5 h-5 text-cyan-400 group-hover:scale-110 transition-transform" /> : <Maximize className="w-5 h-5 text-cyan-400 group-hover:scale-110 transition-transform" />}
           </button>
-          {safeAlerts.length > 1000 && !simIsRunning && (
-              <button onClick={() => setShowAll(!showAll)} className={`font-bold py-2 px-4 rounded shadow-lg text-xs flex items-center transition-colors cursor-pointer ${showAll ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-rose-600 hover:bg-rose-500 text-white'}`}>
-                  {showAll ? 'SHOW LATEST 1000 ONLY' : `LOAD ALL ${safeAlerts.length} ALERTS (MAY LAG)`}
-              </button>
-          )}
         </div>
 
         {isFullscreen && (
@@ -1295,7 +1331,7 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
 // ==========================================
 // MODULE 5: REPORTS / EXPORT
 // ==========================================
-const ExportView = ({ completedRuns }) => {
+const ExportView = ({ completedRuns, fetchHistory }) => {
   const [generatingId, setGeneratingId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [sortConfig, setSortConfig] = useState({ key: 'timestamp', direction: 'desc' });
@@ -1304,6 +1340,31 @@ const ExportView = ({ completedRuns }) => {
   const [rangeEnd, setRangeEnd] = useState('');
   const [rangeReportName, setRangeReportName] = useState('Custom_Time_Range_Report');
   const [isRangeGenerating, setIsRangeGenerating] = useState(false);
+
+  const [purgeDate, setPurgeDate] = useState('');
+  const [isPurging, setIsPurging] = useState(false);
+
+  const handlePurge = async (e) => {
+    e.preventDefault();
+    if (!purgeDate) return alert("Please select a cutoff date.");
+    if (!window.confirm(`WARNING: This will permanently delete ALL simulation runs and their alerts older than ${purgeDate}. This cannot be undone.`)) return;
+    
+    setIsPurging(true);
+    try {
+      const response = await fetch('/api/runs/purge', { 
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ cutoff_date: new Date(purgeDate).toISOString() }) 
+      });
+      const data = await response.json();
+      if (data.status === 'success') {
+        alert(`Successfully deleted ${data.deleted_count} historical missions.`);
+        if (fetchHistory) fetchHistory();
+      } else {
+        alert(`Failed to purge database: ${data.message}`);
+      }
+    } catch (err) { alert("Network error while attempting to purge database."); } 
+    finally { setIsPurging(false); }
+  };
 
   const handleGenerate = async (run) => {
     setGeneratingId(run.id);
@@ -1378,6 +1439,21 @@ const ExportView = ({ completedRuns }) => {
         </form>
       </div>
 
+      <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm border-l-4 border-l-rose-500">
+        <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-4 flex items-center border-b border-slate-800 pb-3"><Server className="w-4 h-4 mr-2 text-rose-500" /> Database Maintenance (Free Disk Space)</h3>
+        <form onSubmit={handlePurge} className="flex flex-col md:flex-row md:items-end gap-4">
+          <div className="flex-1">
+            <label className="block text-xs font-mono text-slate-400 mb-1">Permanently Delete Missions Older Than</label>
+            <input type="datetime-local" step="1" required value={purgeDate} onChange={(e) => setPurgeDate(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-rose-400 font-mono focus:border-rose-500 focus:outline-none" />
+          </div>
+          <div className="w-full md:w-auto">
+            <button type="submit" disabled={isPurging} className="w-full md:w-auto bg-rose-950/50 hover:bg-rose-900 border border-rose-900 text-rose-400 font-bold py-2.5 px-8 rounded text-xs flex items-center justify-center shadow-lg transition-colors cursor-pointer">
+              <Trash2 className="w-4 h-4 mr-2" /> {isPurging ? "PURGING DB..." : "DELETE OLD LOGS"}
+            </button>
+          </div>
+        </form>
+      </div>
+
       <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden shadow-sm">
         <div className="bg-slate-850 border-b border-slate-800 px-5 py-4 flex items-center justify-between">
             <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center"><CheckCircle className="w-4 h-4 mr-2 text-cyan-400"/> Completed Simulations</h3>
@@ -1438,7 +1514,7 @@ export default function App() {
   const [activeWorkspace, setActiveWorkspace] = useState(() => localStorage.getItem('simcore_workspace') || 'Default');
   const [workspaceScenarios, setWorkspaceScenarios] = useState([]);
 
-  const [scenario, setScenario] = useState({ id: null, name: 'Operation Alpha', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: 'Default', kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} });
+  const [scenario, setScenario] = useState({ id: null, name: 'Operation Alpha', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: 'Default', kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {}, deviceGroundMode: {}  });
   const [alertConfig, setAlertConfig] = useState({ 
       minDelaySec: 0.0001, maxDelaySec: 0.0005, 
       enableBatchMode: false, batchSize: 50, batchIntervalSec: 5.0 
@@ -1497,7 +1573,7 @@ export default function App() {
                   return scenarios[0];
               });
           } else {
-              setScenario({ id: null, name: 'New Operation', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {} });
+              setScenario({ id: null, name: 'New Operation', activeDevices: [], udpIp: '127.0.0.1', udpPort: 5005, workspace: activeWorkspace, kmlProbabilities: {}, deviceAlertMapping: {}, deviceDomainMapping: {}, deviceSwarmMode: {}, deviceSwarmSize: {}, deviceSwarmArc: {}, deviceGroundMode: {} });
           }
       }).catch(e => console.error(e));
   };
@@ -1590,7 +1666,8 @@ export default function App() {
         deviceDomainMapping: scenario?.deviceDomainMapping || {}, 
         deviceSwarmMode: scenario?.deviceSwarmMode || {}, 
         deviceSwarmSize: scenario?.deviceSwarmSize || {}, 
-        deviceSwarmArc: scenario?.deviceSwarmArc || {}
+        deviceSwarmArc: scenario?.deviceSwarmArc || {},
+        deviceGroundMode: scenario?.deviceGroundMode || {}
     };
     
     try { 
@@ -1692,7 +1769,7 @@ export default function App() {
           
          {currentView === 'Alert Generator' && <AlertGeneratorView devices={safeDevices} scenario={scenario} setScenario={setScenario} alertConfig={alertConfig} setAlertConfig={setAlertConfig} setCompletedRuns={setCompletedRuns} setActiveAlerts={setActiveAlerts} sensorSchemas={sensorSchemas} simIsRunning={simIsRunning} simLogs={simLogs} simProgress={simProgress} startSimulation={startSimulation} stopSimulation={stopSimulation} overrideCounts={overrideCounts} setOverrideCounts={setOverrideCounts} getAlertCount={getAlertCount} activeWorkspace={activeWorkspace} setActiveWorkspace={setActiveWorkspace} allWorkspaces={allWorkspaces} workspaceScenarios={workspaceScenarios} />}
          
-         {currentView === 'Reports / Export' && <ExportView completedRuns={completedRuns} />}
+         {currentView === 'Reports / Export' && <ExportView completedRuns={completedRuns} fetchHistory={fetchHistory} />}
         </div>
       </main>
     </div>

@@ -8,7 +8,11 @@ SQLALCHEMY_DATABASE_URL = os.getenv(
     "DATABASE_URL", 
     "postgresql://postgres:702073@localhost:5432/simcore_db5"
 )
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, 
+    pool_pre_ping=True, 
+    pool_recycle=1800
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -126,3 +130,6 @@ class SensorEventDB(Base):
     event_id = Column(Integer)
     name = Column(String)
     sensor_type = Column(String)
+
+
+##TESTING IF GIT IS READING THIS FILE
