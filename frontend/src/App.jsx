@@ -1331,7 +1331,7 @@ const MapView = ({ devices = [], alerts = [], simIsRunning, simProgress, totalAl
 // ==========================================
 // MODULE 5: REPORTS / EXPORT
 // ==========================================
-const ExportView = ({ completedRuns }) => {
+const ExportView = ({ completedRuns, fetchHistory }) => {
   const [generatingId, setGeneratingId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [sortConfig, setSortConfig] = useState({ key: 'timestamp', direction: 'desc' });
@@ -1340,6 +1340,31 @@ const ExportView = ({ completedRuns }) => {
   const [rangeEnd, setRangeEnd] = useState('');
   const [rangeReportName, setRangeReportName] = useState('Custom_Time_Range_Report');
   const [isRangeGenerating, setIsRangeGenerating] = useState(false);
+
+  const [purgeDate, setPurgeDate] = useState('');
+  const [isPurging, setIsPurging] = useState(false);
+
+  const handlePurge = async (e) => {
+    e.preventDefault();
+    if (!purgeDate) return alert("Please select a cutoff date.");
+    if (!window.confirm(`WARNING: This will permanently delete ALL simulation runs and their alerts older than ${purgeDate}. This cannot be undone.`)) return;
+    
+    setIsPurging(true);
+    try {
+      const response = await fetch('/api/runs/purge', { 
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ cutoff_date: new Date(purgeDate).toISOString() }) 
+      });
+      const data = await response.json();
+      if (data.status === 'success') {
+        alert(`Successfully deleted ${data.deleted_count} historical missions.`);
+        if (fetchHistory) fetchHistory();
+      } else {
+        alert(`Failed to purge database: ${data.message}`);
+      }
+    } catch (err) { alert("Network error while attempting to purge database."); } 
+    finally { setIsPurging(false); }
+  };
 
   const handleGenerate = async (run) => {
     setGeneratingId(run.id);
@@ -1409,6 +1434,21 @@ const ExportView = ({ completedRuns }) => {
           <div>
             <button type="submit" disabled={isRangeGenerating} className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold py-2.5 px-4 rounded text-xs flex items-center justify-center shadow-lg transition-colors cursor-pointer">
               <Download className="w-4 h-4 mr-2" /> {isRangeGenerating ? "QUERYING..." : "GENERATE KML/CSV"}
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <div className="bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-sm border-l-4 border-l-rose-500">
+        <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider mb-4 flex items-center border-b border-slate-800 pb-3"><Server className="w-4 h-4 mr-2 text-rose-500" /> Database Maintenance (Free Disk Space)</h3>
+        <form onSubmit={handlePurge} className="flex flex-col md:flex-row md:items-end gap-4">
+          <div className="flex-1">
+            <label className="block text-xs font-mono text-slate-400 mb-1">Permanently Delete Missions Older Than</label>
+            <input type="datetime-local" step="1" required value={purgeDate} onChange={(e) => setPurgeDate(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-rose-400 font-mono focus:border-rose-500 focus:outline-none" />
+          </div>
+          <div className="w-full md:w-auto">
+            <button type="submit" disabled={isPurging} className="w-full md:w-auto bg-rose-950/50 hover:bg-rose-900 border border-rose-900 text-rose-400 font-bold py-2.5 px-8 rounded text-xs flex items-center justify-center shadow-lg transition-colors cursor-pointer">
+              <Trash2 className="w-4 h-4 mr-2" /> {isPurging ? "PURGING DB..." : "DELETE OLD LOGS"}
             </button>
           </div>
         </form>
@@ -1729,7 +1769,7 @@ export default function App() {
           
          {currentView === 'Alert Generator' && <AlertGeneratorView devices={safeDevices} scenario={scenario} setScenario={setScenario} alertConfig={alertConfig} setAlertConfig={setAlertConfig} setCompletedRuns={setCompletedRuns} setActiveAlerts={setActiveAlerts} sensorSchemas={sensorSchemas} simIsRunning={simIsRunning} simLogs={simLogs} simProgress={simProgress} startSimulation={startSimulation} stopSimulation={stopSimulation} overrideCounts={overrideCounts} setOverrideCounts={setOverrideCounts} getAlertCount={getAlertCount} activeWorkspace={activeWorkspace} setActiveWorkspace={setActiveWorkspace} allWorkspaces={allWorkspaces} workspaceScenarios={workspaceScenarios} />}
          
-         {currentView === 'Reports / Export' && <ExportView completedRuns={completedRuns} />}
+         {currentView === 'Reports / Export' && <ExportView completedRuns={completedRuns} fetchHistory={fetchHistory} />}
         </div>
       </main>
     </div>

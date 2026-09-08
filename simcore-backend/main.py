@@ -129,6 +129,9 @@ class RangeExportRequest(BaseModel):
     endTime: str
     reportName: Optional[str] = "Time_Range_Report"
 
+class PurgeRequest(BaseModel):
+    cutoff_date: str
+
 class DeleteBatchRequest(BaseModel):
     ids: List[str]
 
@@ -1071,11 +1074,41 @@ def compile_kml_and_csv(report_name: str, alerts: list, devices: list):
 
 @app.get("/api/runs")
 def get_all_runs(db: Session = Depends(get_db)):
-    runs = db.query(SimulationRun).order_by(SimulationRun.id.desc()).all()
+    # THE FIX: Only fetch the 4 lightweight columns needed for the UI table.
+    # We explicitly ignore the massive `devices_snapshot` JSON column, preventing the startup freeze.
+    runs = db.query(
+        SimulationRun.id, 
+        SimulationRun.scenario_name, 
+        SimulationRun.total_alerts, 
+        SimulationRun.timestamp
+    ).order_by(SimulationRun.id.desc()).limit(50).all()
+    
     return [{
-        "id": r.id, "scenarioName": r.scenario_name, "alertsGenerated": r.total_alerts,
-        "timestamp": r.timestamp, "devices": json.loads(r.devices_snapshot) if r.devices_snapshot else []
+        "id": r.id, 
+        "scenarioName": r.scenario_name, 
+        "alertsGenerated": r.total_alerts,
+        "timestamp": r.timestamp, 
+        "devices": [] # Left safely empty to save RAM. The 'Export' button fetches this dynamically later.
     } for r in runs]
+
+@app.post("/api/runs/purge")
+def purge_old_runs(payload: PurgeRequest, db: Session = Depends(get_db)):
+    try:
+        # 1. Identify all runs older than the requested cutoff date
+        old_runs = db.query(SimulationRun).filter(SimulationRun.timestamp < payload.cutoff_date).all()
+        run_ids = [r.id for r in old_runs]
+        
+        if run_ids:
+            # 2. Explicitly delete child AlertLogs first to prevent Foreign Key constraint errors
+            db.query(AlertLog).filter(AlertLog.run_id.in_(run_ids)).delete(synchronize_session=False)
+            # 3. Delete the parent SimulationRuns
+            db.query(SimulationRun).filter(SimulationRun.id.in_(run_ids)).delete(synchronize_session=False)
+            db.commit()
+            
+        return {"status": "success", "deleted_count": len(run_ids)}
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "message": str(e)}
 
 @app.get("/api/export/run/{run_id}")
 def export_specific_run(run_id: int, db: Session = Depends(get_db)):
