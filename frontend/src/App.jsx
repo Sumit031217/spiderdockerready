@@ -166,7 +166,7 @@ const LiveAlertsLayer = React.memo(({ displayedAlerts, mapDevices, scenario }) =
                  {isHovered && alert.full_track_history && alert.full_track_history.length > 1 && (
                      <LeafletPolyline
                          positions={alert.full_track_history}
-                         pathOptions={{ color: pinColor, weight: 2, dashArray: '5, 5', opacity: 0.6 }}
+                         pathOptions={{ color: '#000000', weight: 2, dashArray: '5, 5', opacity: 20 }}
                      />
                  )}
 
